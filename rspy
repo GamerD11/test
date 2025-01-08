@@ -302,12 +302,14 @@ local generation = {}
 local running_threads = {}
 local originalnamecall
 
+local UnreliableRemoteEvent = Instance.new("UnreliableRemoteEvent",Storage)
 local remoteEvent = Instance.new("RemoteEvent",Storage)
 local remoteFunction = Instance.new("RemoteFunction",Storage)
 local NamecallHandler = Instance.new("BindableEvent",Storage)
 local IndexHandler = Instance.new("BindableEvent",Storage)
 local GetDebugIdHandler = Instance.new("BindableFunction",Storage) --Thanks engo for the idea of using BindableFunctions
 
+local originalUnreliableRemoteEvent = UnreliableRemoteEvent.FireServer
 local originalEvent = remoteEvent.FireServer
 local originalFunction = remoteFunction.InvokeServer
 local GetDebugIDInvoke = GetDebugIdHandler.Invoke
@@ -1046,13 +1048,13 @@ function genScript(remote, args)
         if not remote:IsDescendantOf(game) and not getnilrequired then
             gen = "function getNil(name,class) for _,v in next, getnilinstances()do if v.ClassName==class and v.Name==name then return v;end end end\n\n" .. gen
         end
-        if remote:IsA("RemoteEvent") then
+        if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
             gen ..= v2s(remote) .. ":FireServer(unpack(args))"
         elseif remote:IsA("RemoteFunction") then
             gen = gen .. v2s(remote) .. ":InvokeServer(unpack(args))"
         end
     else
-        if remote:IsA("RemoteEvent") then
+        if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
             gen ..= v2s(remote) .. ":FireServer()"
         elseif remote:IsA("RemoteFunction") then
             gen ..= v2s(remote) .. ":InvokeServer()"
@@ -1690,7 +1692,7 @@ function remoteHandler(data)
         history[id].lastCall = tick()
     end
 
-    if data.remote:IsA("RemoteEvent") and lower(data.method) == "fireserver" then
+    if data.remote:IsA("RemoteEvent") or data.remote:IsA("UnreliableRemoteEvent") and lower(data.method) == "fireserver" then
         newRemote("event", data)
     elseif data.remote:IsA("RemoteFunction") and lower(data.method) == "invokeserver" then
         newRemote("function", data)
@@ -1701,7 +1703,7 @@ local newindex = function(method,originalfunction,...)
     if typeof(...) == 'Instance' then
         local remote = cloneref(...)
 
-        if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") then
+        if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent") then
             if not configs.logcheckcaller and checkcaller() then return originalfunction(...) end
             local id = ThreadGetDebugId(remote)
             local blockcheck = tablecheck(blocklist,remote,id)
@@ -1761,7 +1763,7 @@ local newnamecall = newcclosure(function(...)
         if typeof(...) == 'Instance' then
             local remote = cloneref(...)
 
-            if IsA(remote,"RemoteEvent") or IsA(remote,"RemoteFunction") then    
+            if IsA(remote,"RemoteEvent") or IsA(remote,"UnreliableRemoteEvent") or IsA(remote,"RemoteFunction") then    
                 if not configs.logcheckcaller and checkcaller() then return originalnamecall(...) end
                 local id = ThreadGetDebugId(remote)
                 local blockcheck = tablecheck(blocklist,remote,id)
@@ -1819,6 +1821,10 @@ local newFireServer = newcclosure(function(...)
     return newindex("FireServer",originalEvent,...)
 end)
 
+local newUnreliableRemoteEvent = newcclosure(function(...)
+    return newindex("FireServer",originalUnreliableRemoteEvent,...)
+end)
+
 local newInvokeServer = newcclosure(function(...)
     return newindex("InvokeServer",originalFunction,...)
 end)
@@ -1827,10 +1833,12 @@ local function disablehooks()
     if synv3 then
         unhook(getrawmetatable(game).__namecall,originalnamecall)
         unhook(Instance.new("RemoteEvent").FireServer, originalEvent)
+        unhook(Instance.new("UnreliableRemoteEvent").FireServer, originalUnreliableRemoteEvent)
         unhook(Instance.new("RemoteFunction").InvokeServer, originalFunction)
         restorefunction(originalnamecall)
         restorefunction(originalEvent)
         restorefunction(originalFunction)
+        restorefunction(originalUnreliableRemoteEvent)
     else
         if hookmetamethod then
             hookmetamethod(game,"__namecall",originalnamecall)
@@ -1838,17 +1846,19 @@ local function disablehooks()
             hookfunction(getrawmetatable(game).__namecall,originalnamecall)
         end
         hookfunction(Instance.new("RemoteEvent").FireServer, originalEvent)
+        hookfunction(Instance.new("UnreliableRemoteEvent").FireServer, originalUnreliableRemoteEvent)
         hookfunction(Instance.new("RemoteFunction").InvokeServer, originalFunction)
     end
 end
 
---- Toggles on and off the remote spy
+
 function toggleSpy()
     if not toggle then
         local oldnamecall
         if synv3 then
             oldnamecall = hook(getrawmetatable(game).__namecall,clonefunction(newnamecall))
             originalEvent = hook(Instance.new("RemoteEvent").FireServer, clonefunction(newFireServer))
+            originalUnreliableRemoteEvent = hook(Instance.new("UnreliableRemoteEvent").FireServer, clonefunction(newUnreliableRemoteEvent))
             originalFunction = hook(Instance.new("RemoteFunction").InvokeServer, clonefunction(newInvokeServer))
         else
             if hookmetamethod then
@@ -1857,6 +1867,7 @@ function toggleSpy()
                 oldnamecall = hookfunction(getrawmetatable(game).__namecall,clonefunction(newnamecall))
             end
             originalEvent = hookfunction(Instance.new("RemoteEvent").FireServer, clonefunction(newFireServer))
+            originalUnreliableRemoteEvent = hookfunction(Instance.new("UnreliableRemoteEvent").FireServer, clonefunction(newUnreliableRemoteEvent))
             originalFunction = hookfunction(Instance.new("RemoteFunction").InvokeServer, clonefunction(newInvokeServer))
         end
         originalnamecall = originalnamecall or function(...)
@@ -2029,8 +2040,7 @@ newButton("Run Code",
                 local returnvalue
                 local returnValuesTable = {}  -- Table to store return values
 
-                -- Check if the remote is a RemoteEvent or RemoteFunction
-                if Remote:IsA("RemoteEvent") then
+                if Remote:IsA("RemoteEvent") or Remote:IsA("UnreliableRemoteEvent") then
                     returnvalue = Remote:FireServer(unpack(selected.args))
                 else
                     returnvalue = Remote:InvokeServer(unpack(selected.args))
