@@ -10287,7 +10287,7 @@ end)
 
 addcmd('remotespy',{'rspy'},function(args, speaker)
 	notify("Loading",'Hold on a sec')
-	loadstring(game:HttpGet("https://raw.githubusercontent.com/GamerD11/test/refs/heads/main/rspy"))()
+	loadstring(game:HttpGet("https://raw.githubusercontent.com/GamerD11/test/main/rspy"))()
 end)
 
 addcmd('audiologger',{'alogger'},function(args, speaker)
