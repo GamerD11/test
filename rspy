@@ -11,6 +11,74 @@ local realconfigs = {
     supersecretdevtoggle = false
 }
 
+
+-- 1. First, keep your existing serialization functions exactly as they are
+
+local foundSendFunctions = {}
+
+local function formatLuaValue(val, indentLevel)
+	local indent = string.rep("    ", indentLevel)
+
+	if typeof(val) == "Instance" then
+		local path = val:GetFullName()
+		return "game" .. path:sub(5) -- convert to game path
+
+	elseif typeof(val) == "Vector3" then
+		return string.format("Vector3.new(%.6f, %.6f, %.6f)", val.X, val.Y, val.Z)
+
+	elseif typeof(val) == "Vector2" then
+		return string.format("Vector2.new(%.6f, %.6f)", val.X, val.Y)
+
+	elseif typeof(val) == "CFrame" then
+		local components = { val:GetComponents() }
+		return "CFrame.new(" .. table.concat(components, ", ") .. ")"
+
+	elseif typeof(val) == "Color3" then
+		return string.format("Color3.fromRGB(%d, %d, %d)", val.R * 255, val.G * 255, val.B * 255)
+
+	elseif type(val) == "string" then
+		return string.format("%q", val)
+
+	elseif type(val) == "number" or type(val) == "boolean" or type(val) == "nil" then
+		return tostring(val)
+
+	elseif type(val) == "table" then
+		local result = "{\n"
+		for k, v in pairs(val) do
+			local keyStr = type(k) == "string" and string.format("[%q]", k) or "[" .. tostring(k) .. "]"
+			result = result .. indent .. "    " .. keyStr .. " = " .. formatLuaValue(v, indentLevel + 1) .. ",\n"
+		end
+		return result .. indent .. "}"
+
+	else
+		-- Fallback for unsupported types
+		return string.format("--[[unsupported: %s]]", typeof(val))
+	end
+end
+
+local function formatArgsTable(args)
+    return "local args = " .. formatLuaValue(args, 0) .. "\n\n"
+        .. 'game:GetService("ReplicatedStorage").ByteNetReliable:FireServer(unpack(args))'
+end
+
+
+-- 3. Create a separate function to log to SimpleSpy
+
+
+-- 4. Find all send functions (unchanged)
+for _, item in next, getgc(true) do
+    if type(item) == "function" and islclosure(item) then
+        local info = debug.getinfo(item)
+        if info.name == "send" then
+            table.insert(foundSendFunctions, item)
+        end
+    end
+end
+
+
+
+
+
 local configs = newproxy(true)
 local configsmetatable = getmetatable(configs)
 
@@ -1089,6 +1157,10 @@ local CustomGeneration = {
     }
 }
 
+
+
+
+
 local number_table = {
     ["inf"] = "math.huge",
     ["-inf"] = "-math.huge",
@@ -1692,6 +1764,10 @@ function remoteHandler(data)
         history[id].lastCall = tick()
     end
 
+    if not data.bypassBlacklist and (tablecheck(blacklist, data.remote, data.id) or data.remote.Name == "ByteNetReliable") then
+        return
+    end
+
     if data.remote:IsA("RemoteEvent") or data.remote:IsA("UnreliableRemoteEvent") and lower(data.method) == "fireserver" then
         newRemote("event", data)
     elseif data.remote:IsA("RemoteFunction") and lower(data.method) == "invokeserver" then
@@ -1828,6 +1904,9 @@ end)
 local newInvokeServer = newcclosure(function(...)
     return newindex("InvokeServer",originalFunction,...)
 end)
+
+
+
 
 local function disablehooks()
     if synv3 then
@@ -2313,6 +2392,7 @@ function()
 end)
 
 
+
 if configs.supersecretdevtoggle then
     newButton("Load SSV2.2",function()
         return "Load's Simple Spy V2.2"
@@ -2337,3 +2417,58 @@ if configs.supersecretdevtoggle then
         NotSound:Play()
     end)
 end
+
+local blacklist = {
+    ["ByteNetReliable"] = true -- Add this line to prevent normal logging
+}
+
+-- Then modify the hookByteNetFunctions to bypass the blacklist
+local function hookByteNetFunctions()
+    for _, item in next, getgc(true) do
+        if type(item) == "function" and islclosure(item) then
+            local info = debug.getinfo(item)
+            if info.name == "send" then
+                local old
+                old = hookfunction(item, function(...)
+                    local args = {...}
+                    local callingScript = getcallingscript()
+                    
+                    -- Temporarily remove from blacklist for this logging
+                    local wasBlacklisted = blacklist["ByteNetReliable"]
+                    blacklist["ByteNetReliable"] = nil
+                    
+                    -- Create the formatted output
+                    local formattedArgs = "local args = "..v2s(args).."\n\n"
+                    local remotePath = "game:GetService(\"ReplicatedStorage\"):WaitForChild(\"ByteNetReliable\")"
+                    local formattedOutput = formattedArgs..remotePath..":FireServer(unpack(args))"
+                    
+                    local logData = {
+                        remote = game:GetService("ReplicatedStorage").ByteNetReliable,
+                        method = "FireServer",
+                        args = args,
+                        callingscript = callingScript,
+                        id = "ByteNet_"..tick(),
+                        metamethod = "__namecall",
+                        bypassBlacklist = true -- Add flag to bypass blacklist check
+                    }
+                    
+                    -- Queue for SimpleSpy processing
+                    schedule(remoteHandler, logData)
+                    
+                    -- Restore blacklist state
+                    if wasBlacklisted then
+                        blacklist["ByteNetReliable"] = true
+                    end
+                    
+                    return old(...)
+                end)
+            end
+        end
+    end
+end
+
+
+spawn(function()
+    wait(1)
+    hookByteNetFunctions()
+end)
