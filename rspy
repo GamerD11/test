@@ -1537,17 +1537,6 @@ function i2p(i, customgen)
 		return "nil"
 	end
 
-	-- If the instance belongs to a player's character
-	if player and player.Character and i:IsDescendantOf(player.Character) then
-		local pathFromChar = getname(i):gsub("^.-%.Character", "") -- remove leading up to .Character
-		if player == Players.LocalPlayer then
-			return 'game:GetService("Players").LocalPlayer.Character' .. pathFromChar
-		else
-			return pathFromChar
-		end
-	end
-
-	-- Otherwise use full path
 	return getname(i)
 end
 
