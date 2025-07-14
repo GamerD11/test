@@ -12,7 +12,45 @@ local realconfigs = {
 }
 
 
--- 1. First, keep your existing serialization functions exactly as they are
+
+
+local function getFullPath(instance)
+	if not instance then
+		return "nil"
+	end
+	local pathParts = {}
+	local serviceName = nil
+	local function isValidIdentifier(name)
+		return name:match("^[%a_][%w_]*$") ~= nil
+	end
+	local function formatLuaString(name)
+		return "[\"" .. name .. "\"]"
+	end
+	while instance and instance ~= game do
+		local parent = instance.Parent
+		local name = instance.Name
+		if name and not isValidIdentifier(name) then
+			name = formatLuaString(name)
+		end
+		table.insert(pathParts, 1, name)
+		local success, service = pcall(function()
+			return game:GetService(instance.ClassName)
+		end)
+		if success and service == instance then
+			serviceName = instance.ClassName
+			table.remove(pathParts, 1)
+			break
+		end
+		instance = parent
+	end
+	if serviceName then
+		table.insert(pathParts, 1, "game:GetService(\"" .. serviceName .. "\")")
+	else
+		table.insert(pathParts, 1, "game")
+	end
+	return table.concat(pathParts, "."):gsub("%.%[", "[")
+end
+
 
 local foundSendFunctions = {}
 
@@ -20,7 +58,7 @@ local function formatLuaValue(val, indentLevel)
 	local indent = string.rep("    ", indentLevel)
 
 	if typeof(val) == "Instance" then
-		local path = val:GetFullName()
+		local path = getFullPath(val)
 		return "game" .. path:sub(5) -- convert to game path
 
 	elseif typeof(val) == "Vector3" then
@@ -1096,7 +1134,7 @@ function genScript(remote, args)
                     elseif type(i) == "userdata" and typeof(i) ~= "Instance" then
                         gen = gen .. "\n    [" .. string.format("nil --[[%s]]", typeof(v)) .. ")] = "
                     elseif type(i) == "userdata" then
-                         gen = gen .. "\n    [game." .. i:GetFullName() .. ")] = "
+                         gen = gen .. "\n    [" .. getFullPath(i) .. ")] = "
                     end
                     if type(v) ~= "Instance" and type(v) ~= "userdata" then
                         gen = gen .. "object"
@@ -1105,7 +1143,7 @@ function genScript(remote, args)
                     elseif type(v) == "userdata" and typeof(v) ~= "Instance" then
                         gen = gen .. string.format("nil --[[%s]]", typeof(v))
                     elseif type(v) == "userdata" then
-                        gen = gen .. "game." .. v:GetFullName()
+                        gen = gen .. getFullPath(v)
                     end
                 end
                 gen ..= "\n}\n\n"
@@ -1450,71 +1488,71 @@ function f2s(f)
     return tostring(f)
 end
 
---- instance-to-path
---- @param i userdata
-function i2p(i,customgen)
-    if customgen then
-        return customgen
-    end
-    local player = getplayer(i)
-    local parent = i
-    local out = ""
-    if parent == nil then
-        return "nil"
-    elseif player then
-        while true do
-            if parent and parent == player.Character then
-                if player == Players.LocalPlayer then
-                    return 'game:GetService("Players").LocalPlayer.Character' .. out
-                else
-                    return i2p(player) .. ".Character" .. out
-                end
-            else
-                if parent.Name:match("[%a_]+[%w+]*") ~= parent.Name then
-                    out = ':FindFirstChild(' .. formatstr(parent.Name) .. ')' .. out
-                else
-                    out = "." .. parent.Name .. out
-                end
-            end
-            task.wait()
-            parent = parent.Parent
-        end
-    elseif parent ~= game then
-        while true do
-            if parent and parent.Parent == game then
-                if SafeGetService(parent.ClassName) then
-                    if lower(parent.ClassName) == "workspace" then
-                        return `workspace{out}`
-                    else
-                        return 'game:GetService("' .. parent.ClassName .. '")' .. out
-                    end
-                else
-                    if parent.Name:match("[%a_]+[%w_]*") then
-                        return "game." .. parent.Name .. out
-                    else
-                        return 'game:FindFirstChild(' .. formatstr(parent.Name) .. ')' .. out
-                    end
-                end
-            elseif not parent.Parent then
-                getnilrequired = true
-                return 'getNil(' .. formatstr(parent.Name) .. ', "' .. parent.ClassName .. '")' .. out
-            else
-                if parent.Name:match("[%a_]+[%w_]*") ~= parent.Name then
-                    out = ':WaitForChild(' .. formatstr(parent.Name) .. ')' .. out
-                else
-                    out = ':WaitForChild("' .. parent.Name .. '")'..out
-                end
-            end
-            if i:IsDescendantOf(Players.LocalPlayer) then
-                return 'game:GetService("Players").LocalPlayer'..out
-            end
-            parent = parent.Parent
-            task.wait()
-        end
-    else
-        return "game"
-    end
+
+
+local function getname(instance)
+	if not instance then
+		return "nil"
+	end
+	local pathParts = {}
+	local serviceName = nil
+	local function isValidIdentifier(name)
+		return name:match("^[%a_][%w_]*$") ~= nil
+	end
+	local function formatLuaString(name)
+		return "[\"" .. name .. "\"]"
+	end
+	while instance and instance ~= game do
+		local parent = instance.Parent
+		local name = instance.Name
+		if name and not isValidIdentifier(name) then
+			name = formatLuaString(name)
+		end
+		table.insert(pathParts, 1, name)
+		local success, service = pcall(function()
+			return game:GetService(instance.ClassName)
+		end)
+		if success and service == instance then
+			serviceName = instance.ClassName
+			table.remove(pathParts, 1)
+			break
+		end
+		instance = parent
+	end
+	if serviceName then
+		table.insert(pathParts, 1, 'game:GetService("' .. serviceName .. '")')
+	else
+		table.insert(pathParts, 1, "game")
+	end
+	return table.concat(pathParts, "."):gsub("%.%[", "[")
 end
+
+function i2p(i, customgen)
+	if customgen then
+		return customgen
+	end
+
+	local player = getplayer(i)
+	if i == nil then
+		return "nil"
+	end
+
+	-- If the instance belongs to a player's character
+	if player and player.Character and i:IsDescendantOf(player.Character) then
+		local pathFromChar = getname(i):gsub("^.-%.Character", "") -- remove leading up to .Character
+		if player == Players.LocalPlayer then
+			return 'game:GetService("Players").LocalPlayer.Character' .. pathFromChar
+		else
+			return getname(player) .. ".Character" .. pathFromChar
+		end
+	end
+
+	-- Otherwise use full path
+	return getname(i)
+end
+
+
+
 
 --- Gets the player an instance is descended from
 function getplayer(instance)
