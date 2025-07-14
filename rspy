@@ -1543,7 +1543,7 @@ function i2p(i, customgen)
 		if player == Players.LocalPlayer then
 			return 'game:GetService("Players").LocalPlayer.Character' .. pathFromChar
 		else
-			return getname(player) .. ".Character" .. pathFromChar
+			return pathFromChar
 		end
 	end
 
