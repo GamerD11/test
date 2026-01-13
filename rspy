@@ -8,7 +8,8 @@ local realconfigs = {
     funcEnabled = true,
     advancedinfo = false,
     --logreturnvalues = false,
-    supersecretdevtoggle = false
+    supersecretdevtoggle = false,
+    blockallremotes = false  -- Add this line
 }
 
 
@@ -1768,8 +1769,12 @@ local function tablecheck(tabletocheck,instance,id)
     return tabletocheck[id] or tabletocheck[instance.Name]
 end
 
-
 function remoteHandler(data)
+    -- Add blockallremotes check here
+    if configs.blockallremotes then
+        data.blocked = true
+    end
+    
     if configs.autoblock then
         local id = data.id
 
@@ -1798,7 +1803,7 @@ function remoteHandler(data)
 
     -- Generate the script immediately with current instance paths
     local gen = genScript(data.remote, data.args)
-    if data.blocked then
+    if data.blocked or configs.blockallremotes then
         gen = "-- THIS REMOTE WAS PREVENTED FROM FIRING TO THE SERVER BY SIMPLESPY\n\n" .. gen
     end
     
@@ -1813,7 +1818,6 @@ function remoteHandler(data)
 end
 
 
-
 local newindex = function(method,originalfunction,...)
     if typeof(...) == 'Instance' then
         local remote = cloneref(...)
@@ -1821,7 +1825,7 @@ local newindex = function(method,originalfunction,...)
         if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent") then
             if not configs.logcheckcaller and checkcaller() then return originalfunction(...) end
             local id = ThreadGetDebugId(remote)
-            local blockcheck = tablecheck(blocklist,remote,id)
+            local blockcheck = tablecheck(blocklist,remote,id) or configs.blockallremotes  -- Add check here
             local args = {select(2,...)}
 
             if not tablecheck(blacklist,remote,id) and not IsCyclicTable(args) then
@@ -1846,7 +1850,7 @@ local newindex = function(method,originalfunction,...)
 
                 schedule(remoteHandler,data)
 
-                --[[if configs.logreturnvalues and remote:IsA("RemoteFunction") then
+                if configs.logreturnvalues and remote:IsA("RemoteFunction") then
                     local thread = running()
                     local returnargs = {...}
                     local returndata
@@ -1863,9 +1867,9 @@ local newindex = function(method,originalfunction,...)
                     if not blockcheck then
                         return returndata
                     end
-                end]]
                 end
-            if blockcheck then return end
+            end
+            if blockcheck then return end  -- This will block the remote call
         end
     end
     return originalfunction(...)
@@ -1881,7 +1885,7 @@ local newnamecall = newcclosure(function(...)
             if IsA(remote,"RemoteEvent") or IsA(remote,"UnreliableRemoteEvent") or IsA(remote,"RemoteFunction") then    
                 if not configs.logcheckcaller and checkcaller() then return originalnamecall(...) end
                 local id = ThreadGetDebugId(remote)
-                local blockcheck = tablecheck(blocklist,remote,id)
+                local blockcheck = tablecheck(blocklist,remote,id) or configs.blockallremotes  -- Add check here
                 local args = {select(2,...)}
 
                 if not tablecheck(blacklist,remote,id) and not IsCyclicTable(args) then
@@ -1906,7 +1910,7 @@ local newnamecall = newcclosure(function(...)
 
                     schedule(remoteHandler,data)
                     
-                    --[[if configs.logreturnvalues and remote.IsA(remote,"RemoteFunction") then
+                    if configs.logreturnvalues and remote.IsA(remote,"RemoteFunction") then
                         local thread = running()
                         local returnargs = {...}
                         local returndata
@@ -1923,14 +1927,16 @@ local newnamecall = newcclosure(function(...)
                         if not blockcheck then
                             return returndata
                         end
-                    end]]
+                    end
                 end
-                if blockcheck then return end
+                if blockcheck then return end  -- This will block the remote call
             end
         end
     end
     return originalnamecall(...)
 end)
+
+
 
 local newFireServer = newcclosure(function(...)
     return newindex("FireServer",originalEvent,...)
@@ -2429,6 +2435,27 @@ function()
     configs.advancedinfo = not configs.advancedinfo
     TextLabel.Text = ("[%s] Display more remoteinfo"):format(configs.advancedinfo and "ENABLED" or "DISABLED")
 end)
+
+
+newButton(
+    "Block All",
+    function() 
+        return string.format("[%s] Block all remotes from firing (still shows in UI)", 
+            configs.blockallremotes and "ENABLED" or "DISABLED") 
+    end,
+    function()
+        configs.blockallremotes = not configs.blockallremotes
+        TextLabel.Text = string.format("[%s] Block all remotes from firing (still shows in UI)", 
+            configs.blockallremotes and "ENABLED" or "DISABLED")
+        
+        -- Update UI to show the current state
+        if configs.blockallremotes then
+            TextLabel.Text = "All remotes will be blocked from firing to the server!"
+        else
+            TextLabel.Text = "Remotes will fire normally."
+        end
+    end
+)
 
 
 
