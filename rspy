@@ -2289,7 +2289,6 @@ newButton(
     end
 )
 
---- Excludes all Remotes that share the same name as the selected.Log remote from the RemoteSpy
 newButton(
     "Exclude (n)",
     function() return "Click to exclude all remotes with this name.\nExcluding a remote makes SimpleSpy ignore it, but it will continue to be usable." end,
@@ -2447,42 +2446,10 @@ newButton(
         configs.blockallremotes = not configs.blockallremotes
         TextLabel.Text = string.format("[%s] Block all remotes from firing (still shows in UI)", 
             configs.blockallremotes and "ENABLED" or "DISABLED")
-        
-        -- Update UI to show the current state
-        if configs.blockallremotes then
-            TextLabel.Text = "All remotes will be blocked from firing to the server!"
-        else
-            TextLabel.Text = "Remotes will fire normally."
-        end
     end
 )
 
 
-
-if configs.supersecretdevtoggle then
-    newButton("Load SSV2.2",function()
-        return "Load's Simple Spy V2.2"
-    end,
-    function()
-        loadstring(game:HttpGet("https://raw.githubusercontent.com/exxtremestuffs/SimpleSpySource/master/SimpleSpy.lua"))()
-    end)
-    newButton("Load SSV3",function()
-        return "Load's Simple Spy V3"
-    end,
-    function()
-        loadstring(game:HttpGet("https://raw.githubusercontent.com/78n/SimpleSpy/main/SimpleSpySource.lua"))()
-    end)
-    local SuperSecretFolder = Create("Folder",{Parent = SimpleSpy3})
-    newButton("SUPER SECRET BUTTON",function()
-        return "You dont need a discription you already know what it does"
-    end,
-    function()
-        SuperSecretFolder:ClearAllChildren()
-        local random = listfiles("Music")
-        local NotSound = Create("Sound",{Parent = SuperSecretFolder,Looped = false,Volume = math.random(1,5),SoundId = getsynasset(random[math.random(1,#random)])})
-        NotSound:Play()
-    end)
-end
 
 local blacklist = {
     ["ByteNetReliable"] = true -- Add this line to prevent normal logging
