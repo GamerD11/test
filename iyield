@@ -8768,20 +8768,10 @@ addcmd("partpath", {"partname"}, function(args, speaker)
 end)
 
 addcmd("antiafk", {"antiidle"}, function(args, speaker)
-	if getconnections then
-		for _, connection in pairs(getconnections(speaker.Idled)) do
-			if connection["Disable"] then
-				connection["Disable"](connection)
-			elseif connection["Disconnect"] then
-				connection["Disconnect"](connection)
-			end
-		end
-	else
-		speaker.Idled:Connect(function()
-			Services.VirtualUser:CaptureController()
-			Services.VirtualUser:ClickButton2(Vector2.new())
-		end)
-	end
+	speaker.Idled:Connect(function()
+		Services.VirtualUser:CaptureController()
+		Services.VirtualUser:ClickButton2(Vector2.new())
+	end)
 	if not (args[1] and tostring(args[1]) == "nonotify") then notify("Anti Idle", "Anti idle is enabled") end
 end)
 
