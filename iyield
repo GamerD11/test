@@ -4980,13 +4980,11 @@ function respawn(plr)
 		rcdEnabled, wasHidden = gethidden(workspace, "RejectCharacterDeletions") ~= Enum.RejectCharacterDeletions.Disabled
 	end
 
-	if rcdEnabled and replicatesignal then
+	if replicatesignal then
 		replicatesignal(plr.ConnectDiedSignalBackend)
 		task.wait(Players.RespawnTime - 0.1)
 		replicatesignal(plr.Kill)
 	elseif rcdEnabled and not replicatesignal then
-		notify("Incompatible Exploit", "Your exploit does not support this command (missing replicatesignal)")
-	else
 		local char = plr.Character
 		local hum = char:FindFirstChildWhichIsA("Humanoid")
 		if hum then hum:ChangeState(Enum.HumanoidStateType.Dead) end
