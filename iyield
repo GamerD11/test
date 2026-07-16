@@ -5705,108 +5705,149 @@ Cmdbar.Focused:Connect(function()
 	end)
 end)
 
-ESPenabled = false
-CHMSenabled = false
+
 
 function round(num, numDecimalPlaces)
 	local mult = 10^(numDecimalPlaces or 0)
 	return math.floor(num * mult + 0.5) / mult
 end
 
-function ESP(plr, logic)
-	task.spawn(function()
-		for i,v in pairs(COREGUI:GetChildren()) do
-			if v.Name == plr.Name..'_ESP' then
-				v:Destroy()
+-- ============================
+-- ESP System (rewritten)
+-- ============================
+
+ESPenabled = false
+CHMSenabled = false
+local ESPTeamMode = {} -- [Player] = bool, tracks whether that instance was espteam
+local ESPData = {} -- [Player] = { holder, conns = {}, alive = bool }
+
+local function ESPCleanup(plr)
+	local data = ESPData[plr]
+	if not data then return end
+	for _, conn in pairs(data.conns) do
+		if conn then conn:Disconnect() end
+	end
+	if data.holder then
+		data.holder:Destroy()
+	end
+	ESPData[plr] = nil
+end
+
+local function ESPBuild(plr, teamMode)
+	-- fully clean any previous instance for this player first
+	ESPCleanup(plr)
+
+	if plr == Players.LocalPlayer then return end
+
+	local data = { conns = {}, holder = nil }
+	ESPData[plr] = data
+	ESPTeamMode[plr] = teamMode
+
+	local function build(char)
+		-- destroy any stale holder before making a new one
+		if data.holder then
+			data.holder:Destroy()
+			data.holder = nil
+		end
+
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		if not humanoid then
+			humanoid = char:WaitForChild("Humanoid", 5)
+		end
+		if not humanoid or not ESPenabled then return end
+
+		local holder = Instance.new("Folder")
+		holder.Name = plr.Name .. "_ESP"
+		holder.Parent = COREGUI
+		data.holder = holder
+
+		for _, part in pairs(char:GetChildren()) do
+			if part:IsA("BasePart") then
+				local box = Instance.new("BoxHandleAdornment")
+				box.Name = plr.Name
+				box.Adornee = part
+				box.AlwaysOnTop = true
+				box.ZIndex = 10
+				box.Size = part.Size
+				box.Transparency = espTransparency
+				if teamMode then
+					box.Color = BrickColor.new(plr.TeamColor == Players.LocalPlayer.TeamColor and "Bright green" or "Bright red")
+				else
+					box.Color = plr.TeamColor
+				end
+				box.Parent = holder
 			end
 		end
-		wait()
-		if plr.Character and plr.Name ~= Players.LocalPlayer.Name and not COREGUI:FindFirstChild(plr.Name..'_ESP') then
-			local ESPholder = Instance.new("Folder")
-			ESPholder.Name = plr.Name..'_ESP'
-			ESPholder.Parent = COREGUI
-			repeat wait(1) until plr.Character and getRoot(plr.Character) and plr.Character:FindFirstChildOfClass("Humanoid")
-			for b,n in pairs (plr.Character:GetChildren()) do
-				if (n:IsA("BasePart")) then
-					local a = Instance.new("BoxHandleAdornment")
-					a.Name = plr.Name
-					a.Parent = ESPholder
-					a.Adornee = n
-					a.AlwaysOnTop = true
-					a.ZIndex = 10
-					a.Size = n.Size
-					a.Transparency = espTransparency
-					if logic == true then
-						a.Color = BrickColor.new(plr.TeamColor == Players.LocalPlayer.TeamColor and "Bright green" or "Bright red")
-					else
-						a.Color = plr.TeamColor
-					end
-				end
-			end
-			if plr.Character and plr.Character:FindFirstChild('Head') then
-				local BillboardGui = Instance.new("BillboardGui")
-				local TextLabel = Instance.new("TextLabel")
-				BillboardGui.Adornee = plr.Character.Head
-				BillboardGui.Name = plr.Name
-				BillboardGui.Parent = ESPholder
-				BillboardGui.Size = UDim2.new(0, 100, 0, 150)
-				BillboardGui.StudsOffset = Vector3.new(0, 1, 0)
-				BillboardGui.AlwaysOnTop = true
-				TextLabel.Parent = BillboardGui
-				TextLabel.BackgroundTransparency = 1
-				TextLabel.Position = UDim2.new(0, 0, 0, -50)
-				TextLabel.Size = UDim2.new(0, 100, 0, 100)
-				TextLabel.Font = Enum.Font.SourceSansSemibold
-				TextLabel.TextSize = 20
-				TextLabel.TextColor3 = Color3.new(1, 1, 1)
-				TextLabel.TextStrokeTransparency = 0
-				TextLabel.TextYAlignment = Enum.TextYAlignment.Bottom
-				TextLabel.Text = 'Name: '..plr.Name
-				TextLabel.ZIndex = 10
-				local espLoopFunc
-				local teamChange
-				local addedFunc
-				addedFunc = plr.CharacterAdded:Connect(function()
-					if ESPenabled then
-						espLoopFunc:Disconnect()
-						teamChange:Disconnect()
-						ESPholder:Destroy()
-						repeat wait(1) until getRoot(plr.Character) and plr.Character:FindFirstChildOfClass("Humanoid")
-						ESP(plr, logic)
-						addedFunc:Disconnect()
-					else
-						teamChange:Disconnect()
-						addedFunc:Disconnect()
-					end
-				end)
-				teamChange = plr:GetPropertyChangedSignal("TeamColor"):Connect(function()
-					if ESPenabled then
-						espLoopFunc:Disconnect()
-						addedFunc:Disconnect()
-						ESPholder:Destroy()
-						repeat wait(1) until getRoot(plr.Character) and plr.Character:FindFirstChildOfClass("Humanoid")
-						ESP(plr, logic)
-						teamChange:Disconnect()
-					else
-						teamChange:Disconnect()
-					end
-				end)
-				local function espLoop()
-					if COREGUI:FindFirstChild(plr.Name..'_ESP') then
-						if plr.Character and getRoot(plr.Character) and plr.Character:FindFirstChildOfClass("Humanoid") and Players.LocalPlayer.Character and getRoot(Players.LocalPlayer.Character) and Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
-							local pos = math.floor((getRoot(Players.LocalPlayer.Character).Position - getRoot(plr.Character).Position).magnitude)
-							TextLabel.Text = 'Name: '..plr.Name..' | Health: '..round(plr.Character:FindFirstChildOfClass('Humanoid').Health, 1)..' | Studs: '..pos
-						end
-					else
-						teamChange:Disconnect()
-						addedFunc:Disconnect()
-						espLoopFunc:Disconnect()
-					end
-				end
-				espLoopFunc = RunService.RenderStepped:Connect(espLoop)
-			end
+
+		local head = char:FindFirstChild("Head")
+		if head then
+			local billboard = Instance.new("BillboardGui")
+			billboard.Adornee = head
+			billboard.Name = plr.Name
+			billboard.Size = UDim2.new(0, 100, 0, 150)
+			billboard.StudsOffset = Vector3.new(0, 1, 0)
+			billboard.AlwaysOnTop = true
+			billboard.Parent = holder
+
+			local label = Instance.new("TextLabel")
+			label.BackgroundTransparency = 1
+			label.Position = UDim2.new(0, 0, 0, -50)
+			label.Size = UDim2.new(0, 100, 0, 100)
+			label.Font = Enum.Font.SourceSansSemibold
+			label.TextSize = 20
+			label.TextColor3 = Color3.new(1, 1, 1)
+			label.TextStrokeTransparency = 0
+			label.TextYAlignment = Enum.TextYAlignment.Bottom
+			label.Text = "Name: " .. plr.Name
+			label.ZIndex = 10
+			label.Parent = billboard
+
+			data.conns.loop = RunService.RenderStepped:Connect(function()
+				if not ESPenabled or not data.holder then return end
+				local lchar = Players.LocalPlayer.Character
+				if not (char.Parent and humanoid.Parent and lchar and getRoot(lchar)) then return end
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if not hum then return end
+				local dist = math.floor((getRoot(lchar).Position - getRoot(char).Position).Magnitude)
+				label.Text = "Name: " .. plr.Name .. " | Health: " .. round(hum.Health, 1) .. " | Studs: " .. dist
+			end)
+		end
+	end
+
+	if plr.Character then
+		build(plr.Character)
+	end
+
+	data.conns.charAdded = plr.CharacterAdded:Connect(function(char)
+		if not ESPenabled then return end
+		build(char)
+	end)
+
+	data.conns.teamChanged = plr:GetPropertyChangedSignal("TeamColor"):Connect(function()
+		if not ESPenabled then return end
+		if plr.Character then
+			build(plr.Character)
 		end
 	end)
+end
+
+function ESP(plr, teamMode)
+	if not ESPenabled then return end
+	ESPBuild(plr, teamMode)
+end
+
+function ESPStopAll()
+	for plr, _ in pairs(ESPData) do
+		ESPCleanup(plr)
+	end
+	ESPData = {}
+	ESPTeamMode = {}
+	-- catch any stray holders (e.g. from a previous bad state)
+	for _, v in pairs(COREGUI:GetChildren()) do
+		if string.sub(v.Name, -4) == "_ESP" then
+			v:Destroy()
+		end
+	end
 end
 
 function CHMS(plr)
@@ -8020,38 +8061,34 @@ addcmd('lastcommand',{'lastcmd'},function(args, speaker)
 end)
 
 addcmd('esp',{},function(args, speaker)
-	if not CHMSenabled then
-		ESPenabled = true
-		for i,v in pairs(Players:GetPlayers()) do
-			if v.Name ~= speaker.Name then
-				ESP(v)
-			end
-		end
-	else
+	if CHMSenabled then
 		notify('ESP','Disable chams (nochams) before using esp')
+		return
+	end
+	ESPenabled = true
+	for i,v in pairs(Players:GetPlayers()) do
+		if v ~= speaker then
+			ESP(v, false)
+		end
 	end
 end)
 
 addcmd('espteam',{},function(args, speaker)
-	if not CHMSenabled then
-		ESPenabled = true
-		for i,v in pairs(Players:GetPlayers()) do
-			if v.Name ~= speaker.Name then
-				ESP(v, true)
-			end
-		end
-	else
+	if CHMSenabled then
 		notify('ESP','Disable chams (nochams) before using esp')
+		return
+	end
+	ESPenabled = true
+	for i,v in pairs(Players:GetPlayers()) do
+		if v ~= speaker then
+			ESP(v, true)
+		end
 	end
 end)
 
 addcmd('noesp',{'unesp','unespteam'},function(args, speaker)
 	ESPenabled = false
-	for i,c in pairs(COREGUI:GetChildren()) do
-		if string.sub(c.Name, -4) == '_ESP' then
-			c:Destroy()
-		end
-	end
+	ESPStopAll()
 end)
 
 addcmd("esptransparency", {}, function(args, speaker)
