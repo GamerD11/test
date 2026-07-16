@@ -5817,7 +5817,7 @@ local function ESPBuild(plr, teamMode)
 				local hum = char:FindFirstChildOfClass("Humanoid")
 				if not hum then return end
 				local dist = math.floor((getRoot(lchar).Position - getRoot(char).Position).Magnitude)
-				label.Text = "Name: " .. plr.Name .. " | Health: " .. round(hum.Health, 1) .. " | Studs: " .. dist
+				label.Text =  plr.Name .. " |  " .. tostring(dist)
 			end)
 		end
 	end
