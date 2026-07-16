@@ -5720,6 +5720,7 @@ ESPenabled = false
 CHMSenabled = false
 local ESPTeamMode = {} -- [Player] = bool, tracks whether that instance was espteam
 local ESPData = {} -- [Player] = { holder, conns = {}, alive = bool }
+local ESPLastTeamMode = false -- remembers last esp/espteam mode for players who join later
 
 local function ESPCleanup(plr)
 	local data = ESPData[plr]
@@ -5744,6 +5745,13 @@ local function ESPBuild(plr, teamMode)
 	ESPTeamMode[plr] = teamMode
 
 	local function build(char)
+		-- FIX: disconnect the previous update loop before making a new one,
+		-- otherwise every respawn/teamchange leaks a RenderStepped connection
+		if data.conns.loop then
+			data.conns.loop:Disconnect()
+			data.conns.loop = nil
+		end
+
 		-- destroy any stale holder before making a new one
 		if data.holder then
 			data.holder:Destroy()
@@ -5833,6 +5841,14 @@ end
 
 function ESP(plr, teamMode)
 	if not ESPenabled then return end
+	-- FIX: if caller doesn't specify a mode (e.g. the PlayerAdded handler
+	-- just calls ESP(plr)), fall back to whatever mode was last used by
+	-- the esp/espteam commands instead of silently defaulting to false
+	if teamMode == nil then
+		teamMode = ESPLastTeamMode
+	else
+		ESPLastTeamMode = teamMode
+	end
 	ESPBuild(plr, teamMode)
 end
 
@@ -5842,6 +5858,7 @@ function ESPStopAll()
 	end
 	ESPData = {}
 	ESPTeamMode = {}
+	ESPLastTeamMode = false
 	-- catch any stray holders (e.g. from a previous bad state)
 	for _, v in pairs(COREGUI:GetChildren()) do
 		if string.sub(v.Name, -4) == "_ESP" then
@@ -5849,6 +5866,11 @@ function ESPStopAll()
 		end
 	end
 end
+
+
+Players.PlayerRemoving:Connect(function(plr)
+	ESPCleanup(plr)
+end)
 
 function CHMS(plr)
 	task.spawn(function()
