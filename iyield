@@ -5857,7 +5857,7 @@ local function ESPBuild(plr, teamMode)
 				end
 
 				local dist = math.floor((lroot.Position - root.Position).Magnitude)
-				label.Text = string.format("%s | %d", plr.DisplayName or plr.Name, dist)
+				label.Text = string.format("%s | %d", plr.Name, dist)
 			end)
 		end
 	end
