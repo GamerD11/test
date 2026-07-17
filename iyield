@@ -5857,9 +5857,7 @@ local function ESPBuild(plr, teamMode)
 				end
 
 				local dist = math.floor((lroot.Position - root.Position).Magnitude)
-				local hp = math.floor(hum.Health + 0.5)
-				local maxhp = math.floor(hum.MaxHealth + 0.5)
-				label.Text = string.format("%s  |  %d/%d HP  |  %d studs", plr.DisplayName or plr.Name, hp, maxhp, dist)
+				label.Text = string.format("%s | %d", plr.DisplayName or plr.Name, dist)
 			end)
 		end
 	end
