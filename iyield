@@ -5713,46 +5713,78 @@ function round(num, numDecimalPlaces)
 end
 
 -- ============================
--- ESP System (rewritten)
+-- ESP System (proper detection rewrite)
 -- ============================
 
 ESPenabled = false
 CHMSenabled = false
-local ESPTeamMode = {} -- [Player] = bool, tracks whether that instance was espteam
-local ESPData = {} -- [Player] = { holder, conns = {}, alive = bool }
-local ESPLastTeamMode = false -- remembers last esp/espteam mode for players who join later
+local ESPTeamMode = {}          -- [Player] = bool
+local ESPData = {}              -- [Player] = { holder, conns = {} }
+local ESPLastTeamMode = false
 
 local function ESPCleanup(plr)
 	local data = ESPData[plr]
 	if not data then return end
 	for _, conn in pairs(data.conns) do
-		if conn then conn:Disconnect() end
+		pcall(function() if conn then conn:Disconnect() end end)
 	end
-	if data.holder then
+	if data.holder and data.holder.Parent then
 		data.holder:Destroy()
 	end
 	ESPData[plr] = nil
+	ESPTeamMode[plr] = nil
+end
+
+local function safeRoot(char)
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart")
+		or char:FindFirstChild("Torso")
+		or char:FindFirstChild("UpperTorso")
+		or char.PrimaryPart
 end
 
 local function ESPBuild(plr, teamMode)
-	-- fully clean any previous instance for this player first
 	ESPCleanup(plr)
-
 	if plr == Players.LocalPlayer then return end
 
 	local data = { conns = {}, holder = nil }
 	ESPData[plr] = data
 	ESPTeamMode[plr] = teamMode
 
+	local function adornPart(part, holder)
+		if not part:IsA("BasePart") then return end
+		if part.Name == "HumanoidRootPart" then return end
+		-- skip tiny / invisible parts that just create visual noise
+		if part.Size.Magnitude < 0.35 then return end
+
+		local box = Instance.new("BoxHandleAdornment")
+		box.Name = plr.Name
+		box.Adornee = part
+		box.AlwaysOnTop = true
+		box.ZIndex = 10
+		box.Size = part.Size
+		box.Transparency = espTransparency
+		if teamMode then
+			local sameTeam = (plr.TeamColor == Players.LocalPlayer.TeamColor)
+			box.Color = BrickColor.new(sameTeam and "Bright green" or "Bright red")
+		else
+			box.Color = plr.TeamColor
+		end
+		box.Parent = holder
+	end
+
 	local function build(char)
-		-- FIX: disconnect the previous update loop before making a new one,
-		-- otherwise every respawn/teamchange leaks a RenderStepped connection
+		if not ESPenabled or not char then return end
+
+		-- kill previous loop + holder
 		if data.conns.loop then
-			data.conns.loop:Disconnect()
+			pcall(function() data.conns.loop:Disconnect() end)
 			data.conns.loop = nil
 		end
-
-		-- destroy any stale holder before making a new one
+		if data.conns.descAdded then
+			pcall(function() data.conns.descAdded:Disconnect() end)
+			data.conns.descAdded = nil
+		end
 		if data.holder then
 			data.holder:Destroy()
 			data.holder = nil
@@ -5760,7 +5792,7 @@ local function ESPBuild(plr, teamMode)
 
 		local humanoid = char:FindFirstChildOfClass("Humanoid")
 		if not humanoid then
-			humanoid = char:WaitForChild("Humanoid", 5)
+			humanoid = char:WaitForChild("Humanoid", 8)
 		end
 		if not humanoid or not ESPenabled then return end
 
@@ -5769,72 +5801,72 @@ local function ESPBuild(plr, teamMode)
 		holder.Parent = COREGUI
 		data.holder = holder
 
-		for _, part in pairs(char:GetChildren()) do
-			if part:IsA("BasePart") then
-				local box = Instance.new("BoxHandleAdornment")
-				box.Name = plr.Name
-				box.Adornee = part
-				box.AlwaysOnTop = true
-				box.ZIndex = 10
-				box.Size = part.Size
-				box.Transparency = espTransparency
-				if teamMode then
-					box.Color = BrickColor.new(plr.TeamColor == Players.LocalPlayer.TeamColor and "Bright green" or "Bright red")
-				else
-					box.Color = plr.TeamColor
-				end
-				box.Parent = holder
-			end
+		-- adorn everything currently present (GetDescendants catches more than GetChildren)
+		for _, part in ipairs(char:GetDescendants()) do
+			adornPart(part, holder)
 		end
 
-		local head = char:FindFirstChild("Head")
+		-- keep watching for late-loading accessories / packages / layered clothing / tools
+		data.conns.descAdded = char.DescendantAdded:Connect(function(desc)
+			if ESPenabled and data.holder and data.holder.Parent then
+				adornPart(desc, data.holder)
+			end
+		end)
+
+		local head = char:FindFirstChild("Head") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
 		if head then
 			local billboard = Instance.new("BillboardGui")
 			billboard.Adornee = head
 			billboard.Name = plr.Name
-			billboard.Size = UDim2.new(0, 100, 0, 150)
-			billboard.StudsOffset = Vector3.new(0, 1, 0)
+			billboard.Size = UDim2.new(0, 220, 0, 50)
+			billboard.StudsOffset = Vector3.new(0, 2.8, 0)
 			billboard.AlwaysOnTop = true
 			billboard.Parent = holder
 
 			local label = Instance.new("TextLabel")
 			label.BackgroundTransparency = 1
-			label.Position = UDim2.new(0, 0, 0, -50)
-			label.Size = UDim2.new(0, 100, 0, 100)
-			label.Font = Enum.Font.SourceSansSemibold
-			label.TextSize = 20
+			label.Size = UDim2.new(1, 0, 1, 0)
+			label.Font = Enum.Font.GothamBold
+			label.TextSize = 14
 			label.TextColor3 = Color3.new(1, 1, 1)
 			label.TextStrokeTransparency = 0
-			label.TextYAlignment = Enum.TextYAlignment.Bottom
-			label.Text = "Name: " .. plr.Name
-			label.ZIndex = 10
+			label.TextStrokeColor3 = Color3.new(0, 0, 0)
+			label.TextYAlignment = Enum.TextYAlignment.Center
+			label.Text = plr.DisplayName or plr.Name
 			label.Parent = billboard
 
-			data.conns.loop = RunService.RenderStepped:Connect(function()
-				if not ESPenabled or not data.holder then return end
+			data.conns.loop = RunService.Heartbeat:Connect(function()
+				if not ESPenabled or not data.holder or not data.holder.Parent then return end
 				local lchar = Players.LocalPlayer.Character
-				if not (char.Parent and humanoid.Parent and lchar and getRoot(lchar)) then return end
+				local lroot = safeRoot(lchar)
+				local root = safeRoot(char)
 				local hum = char:FindFirstChildOfClass("Humanoid")
-				if not hum then return end
-				local dist = math.floor((getRoot(lchar).Position - getRoot(char).Position).Magnitude)
-				label.Text =  plr.Name .. " |  " .. tostring(dist)
+				if not (lroot and root and hum) then return end
+
+				local dist = math.floor((lroot.Position - root.Position).Magnitude)
+				local hp = math.floor(hum.Health + 0.5)
+				local maxhp = math.floor(hum.MaxHealth + 0.5)
+				label.Text = string.format("%s  |  %d/%d HP  |  %d studs", plr.DisplayName or plr.Name, hp, maxhp, dist)
 			end)
 		end
 	end
 
+	-- existing character
 	if plr.Character then
-		build(plr.Character)
+		task.spawn(build, plr.Character)
 	end
 
+	-- future characters
 	data.conns.charAdded = plr.CharacterAdded:Connect(function(char)
-		if not ESPenabled then return end
-		build(char)
+		if ESPenabled then
+			task.spawn(build, char)
+		end
 	end)
 
+	-- team colour changes
 	data.conns.teamChanged = plr:GetPropertyChangedSignal("TeamColor"):Connect(function()
-		if not ESPenabled then return end
-		if plr.Character then
-			build(plr.Character)
+		if ESPenabled and plr.Character then
+			task.spawn(build, plr.Character)
 		end
 	end)
 end
@@ -5853,24 +5885,24 @@ function ESP(plr, teamMode)
 end
 
 function ESPStopAll()
-	for plr, _ in pairs(ESPData) do
+	for plr in pairs(ESPData) do
 		ESPCleanup(plr)
 	end
 	ESPData = {}
 	ESPTeamMode = {}
 	ESPLastTeamMode = false
 	-- catch any stray holders (e.g. from a previous bad state)
-	for _, v in pairs(COREGUI:GetChildren()) do
+	for _, v in ipairs(COREGUI:GetChildren()) do
 		if string.sub(v.Name, -4) == "_ESP" then
 			v:Destroy()
 		end
 	end
 end
 
-
 Players.PlayerRemoving:Connect(function(plr)
 	ESPCleanup(plr)
 end)
+
 
 function CHMS(plr)
 	task.spawn(function()
@@ -13213,8 +13245,7 @@ Players.PlayerAdded:Connect(function(plr)
 	JoinLog(plr)
 	if isLegacyChat then ChatLog(plr) end
 	if ESPenabled then
-		repeat wait(1) until plr.Character and getRoot(plr.Character)
-		ESP(plr)
+		ESP(plr)   -- CharacterAdded + immediate build handles detection properly
 	end
 	if CHMSenabled then
 		repeat wait(1) until plr.Character and getRoot(plr.Character)
