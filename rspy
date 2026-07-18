@@ -24,7 +24,7 @@ local function getFullPath(instance)
 		return name:match("^[%a_][%w_]*$") ~= nil
 	end
 	local function formatLuaString(name)
-		return "[\" .. name .. "\"]"
+		return "[\"" .. name .. "\"]"
 	end
 
 	-- === Smart equipped tool detection ===
@@ -2304,15 +2304,33 @@ newButton(
     function() return "Click to clear logs" end,
     function()
         TextLabel.Text = "Clearing..."
-        clear(logs)
-        for i,v in next, LogList:GetChildren() do
-            if not v:IsA("UIListLayout") then
-                v:Destroy()
+
+        -- Disconnect old connections and clear remoteLogs
+        for _, v in next, remoteLogs do
+            if typeof(v[1]) == "RBXScriptConnection" then
+                pcall(function() v[1]:Disconnect() end)
+            end
+            if typeof(v[2]) == "Instance" then
+                pcall(function() v[2]:Destroy() end)
             end
         end
+        remoteLogs = {}
+        clear(logs)
+
+        -- Destroy remaining UI elements
+        for i,v in next, LogList:GetChildren() do
+            if not v:IsA("UIListLayout") then
+                pcall(function() v:Destroy() end)
+            end
+        end
+
+        -- Reset layout order
+        layoutOrderNum = 999999999
+
         codebox:setRaw("")
         selected = nil
         TextLabel.Text = "Logs cleared!"
+        updateRemoteCanvas()
     end
 )
 
