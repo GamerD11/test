@@ -157,17 +157,41 @@ local function formatLuaValue(val, indentLevel)
 		return tostring(val)
 
 	elseif type(val) == "table" then
-		local result = "{\n"
-		for k, v in pairs(val) do
-			local keyStr = type(k) == "string" and string.format("[%q]", k) or "[" .. tostring(k) .. "]"
-			result = result .. indent .. "    " .. keyStr .. " = " .. formatLuaValue(v, indentLevel + 1) .. ",\n"
-		end
-		return result .. indent .. "}"
+		-- Collect numeric keys and find max index
+		local maxIndex = 0
+		local hasNonNumericKey = false
 
-	else
-		-- Fallback for unsupported types
-		return string.format("--[[unsupported: %s]]", typeof(val))
+		for k, _ in pairs(val) do
+			if type(k) == "number" and k == math.floor(k) and k > 0 then
+				if k > maxIndex then
+					maxIndex = k
+				end
+			else
+				hasNonNumericKey = true
+			end
+		end
+
+		if not hasNonNumericKey and maxIndex > 0 then
+			-- Numeric table (possibly with gaps) → generate as normal array with nils filled in
+			local result = "{\n"
+			for i = 1, maxIndex do
+				local v = val[i] -- will be nil if key doesn't exist
+				result = result .. indent .. "    " .. formatLuaValue(v, indentLevel + 1) .. ",\n"
+			end
+			return result .. indent .. "}"
+		else
+			-- Has string keys or non-positive keys → use explicit [key] = style
+			local result = "{\n"
+			for k, v in pairs(val) do
+				local keyStr = type(k) == "string" and string.format("[%q]", k) or "[" .. tostring(k) .. "]"
+				result = result .. indent .. "    " .. keyStr .. " = " .. formatLuaValue(v, indentLevel + 1) .. ",\n"
+			end
+			return result .. indent .. "}"
+		end
 	end
+
+	-- Fallback for unsupported types
+	return string.format("--[[unsupported: %s]]", typeof(val))
 end
 
 local function formatArgsTable(args)
@@ -403,15 +427,26 @@ local Highlight = (isfile and loadfile and isfile("Highlight.lua") and loadfile(
 
 local SimpleSpy3 = Create("ScreenGui",{ResetOnSpawn = false})
 local Storage = Create("Folder",{})
-local Background = Create("Frame",{Parent = SimpleSpy3,BackgroundColor3 = Color3.new(1, 1, 1),BackgroundTransparency = 1,Position = UDim2.new(0, 500, 0, 200),Size = UDim2.new(0, 450, 0, 268)})
-local LeftPanel = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(53, 52, 55),BorderSizePixel = 0,Position = UDim2.new(0, 0, 0, 19),Size = UDim2.new(0, 131, 0, 249)})
+local Background = Create("Frame",{Parent = SimpleSpy3,BackgroundColor3 = Color3.fromRGB(30, 30, 30),BackgroundTransparency = 0,Position = UDim2.new(0, 500, 0, 200),Size = UDim2.new(0, 450, 0, 268)})
+Create("UICorner", {Parent = Background, CornerRadius = UDim.new(0, 8)})
+
+local LeftPanel = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(37, 37, 38),BorderSizePixel = 0,Position = UDim2.new(0, 0, 0, 19),Size = UDim2.new(0, 131, 0, 249)})
+Create("UICorner", {Parent = LeftPanel, CornerRadius = UDim.new(0, 6)})
+
 local LogList = Create("ScrollingFrame",{Parent = LeftPanel,Active = true,BackgroundColor3 = Color3.new(1, 1, 1),BackgroundTransparency = 1,BorderSizePixel = 0,Position = UDim2.new(0, 0, 0, 9),Size = UDim2.new(0, 131, 0, 232),CanvasSize = UDim2.new(0, 0, 0, 0),ScrollBarThickness = 4})
 local UIListLayout = Create("UIListLayout",{Parent = LogList,HorizontalAlignment = Enum.HorizontalAlignment.Center,SortOrder = Enum.SortOrder.LayoutOrder})
-local RightPanel = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(37, 36, 38),BorderSizePixel = 0,Position = UDim2.new(0, 131, 0, 19),Size = UDim2.new(0, 319, 0, 249)})
-local CodeBox = Create("Frame",{Parent = RightPanel,BackgroundColor3 = Color3.new(0.0823529, 0.0745098, 0.0784314),BorderSizePixel = 0,Size = UDim2.new(0, 319, 0, 119)})
+
+local RightPanel = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(45, 45, 48),BorderSizePixel = 0,Position = UDim2.new(0, 131, 0, 19),Size = UDim2.new(0, 319, 0, 249)})
+Create("UICorner", {Parent = RightPanel, CornerRadius = UDim.new(0, 6)})
+
+local CodeBox = Create("Frame",{Parent = RightPanel,BackgroundColor3 = Color3.fromRGB(30, 30, 30),BorderSizePixel = 0,Size = UDim2.new(0, 319, 0, 119)})
+Create("UICorner", {Parent = CodeBox, CornerRadius = UDim.new(0, 4)})
+
 local ScrollingFrame = Create("ScrollingFrame",{Parent = RightPanel,Active = true,BackgroundColor3 = Color3.new(1, 1, 1),BackgroundTransparency = 1,Position = UDim2.new(0, 0, 0.5, 0),Size = UDim2.new(1, 0, 0.5, -9),CanvasSize = UDim2.new(0, 0, 0, 0),ScrollBarThickness = 4})
 local UIGridLayout = Create("UIGridLayout",{Parent = ScrollingFrame,HorizontalAlignment = Enum.HorizontalAlignment.Center,SortOrder = Enum.SortOrder.LayoutOrder,CellPadding = UDim2.new(0, 0, 0, 0),CellSize = UDim2.new(0, 94, 0, 27)})
-local TopBar = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(37, 35, 38),BorderSizePixel = 0,Size = UDim2.new(0, 450, 0, 19)})
+
+local TopBar = Create("Frame",{Parent = Background,BackgroundColor3 = Color3.fromRGB(30, 30, 30),BorderSizePixel = 0,Size = UDim2.new(0, 450, 0, 19)})
+Create("UICorner", {Parent = TopBar, CornerRadius = UDim.new(0, 6)})
 local Simple = Create("TextButton",{Parent = TopBar,BackgroundColor3 = Color3.new(1, 1, 1),AutoButtonColor = false,BackgroundTransparency = 1,Position = UDim2.new(0, 5, 0, 0),Size = UDim2.new(0, 57, 0, 18),Font = Enum.Font.SourceSansBold,Text =  "SimpleSpy",TextColor3 = Color3.new(1, 1, 1),TextSize = 14,TextXAlignment = Enum.TextXAlignment.Left})
 local CloseButton = Create("TextButton",{Parent = TopBar,BackgroundColor3 = Color3.new(0.145098, 0.141176, 0.14902),BorderSizePixel = 0,Position = UDim2.new(1, -19, 0, 0),Size = UDim2.new(0, 19, 0, 19),Font = Enum.Font.SourceSans,Text = "",TextColor3 = Color3.new(0, 0, 0),TextSize = 14})
 local ImageLabel = Create("ImageLabel",{Parent = CloseButton,BackgroundColor3 = Color3.new(1, 1, 1),BackgroundTransparency = 1,Position = UDim2.new(0, 5, 0, 5),Size = UDim2.new(0, 9, 0, 9),Image = "http://www.roblox.com/asset/?id=5597086202"})
@@ -425,8 +460,8 @@ local TextLabel = Create("TextLabel",{Parent = ToolTip,BackgroundColor3 = Color3
 
 -------------------------------------------------------------------------------
 
-local selectedColor = Color3.new(0.321569, 0.333333, 1)
-local deselectedColor = Color3.new(0.8, 0.8, 0.8)
+local selectedColor = Color3.fromRGB(88, 101, 242) -- Modern blue accent
+local deselectedColor = Color3.fromRGB(128, 128, 128)
 --- So things are descending
 local layoutOrderNum = 999999999
 --- Whether or not the gui is closing
@@ -1503,29 +1538,47 @@ function t2s(t, l, p, n, vtv, i, pt, path, tables, tI)
     local s =  "{" -- start of serialization
     local size = 0
     l += indent -- set indentation level
-    for k, v in next, t do -- iterates over table
-        size = size + 1 -- changes size for max limit
-        if size > (getgenv().SimpleSpyMaxTableSize or 1000) then
-            s = s .. "\n" .. string.rep(" ", l) .. "-- MAXIMUM TABLE SIZE REACHED, CHANGE 'getgenv().SimpleSpyMaxTableSize' TO ADJUST MAXIMUM SIZE "
-            break
+
+    -- Modernized numeric array generation (fills missing indices with nil)
+    local maxNum = 0
+    local pureNum = true
+    for kk,_ in next, t do
+        if type(kk)=="number" and kk>0 and kk==math.floor(kk) then
+            if kk > maxNum then maxNum=kk end
+        else pureNum=false break end
+    end
+    if pureNum and maxNum>0 then
+        for i=1,maxNum do
+            size+=1
+            if size > (getgenv().SimpleSpyMaxTableSize or 1000) then break end
+            local val = t[i]
+            local valStr = (val == nil) and "nil" or v2s(val, l, p, n, vtv, i, t, path.."["..i.."]", tables, tI)
+            s = s .. "\n" .. string.rep(" ", l) .. "[" .. i .. "] = " .. valStr .. ","
         end
-        if rawequal(k, t) then -- checks if the table being iterated over is being used as an index within itself (yay, lua)
-            bottomstr ..= `\n{n}{path}[{n}{path}] = {(rawequal(v,k) and `{n}{path}` or v2s(v, l, p, n, vtv, k, t, `{path}[{n}{path}]`, tables))}`
-            --bottomstr = bottomstr .. "\n" .. rawtostring(n) .. rawtostring(path) .. "[" .. rawtostring(n) .. rawtostring(path) .. "]" .. " = " .. (rawequal(v, k) and rawtostring(n) .. rawtostring(path) or v2s(v, l, p, n, vtv, k, t, path .. "[" .. rawtostring(n) .. rawtostring(path) .. "]", tables))
-            size -= 1
-            continue
+    else
+        for k, v in next, t do -- iterates over table
+            size = size + 1 -- changes size for max limit
+            if size > (getgenv().SimpleSpyMaxTableSize or 1000) then
+                s = s .. "\n" .. string.rep(" ", l) .. "-- MAXIMUM TABLE SIZE REACHED, CHANGE 'getgenv().SimpleSpyMaxTableSize' TO ADJUST MAXIMUM SIZE "
+                break
+            end
+            if rawequal(k, t) then -- checks if the table being iterated over is being used as an index within itself (yay, lua)
+                bottomstr ..= `\n{n}{path}[{n}{path}] = {(rawequal(v,k) and `{n}{path}` or v2s(v, l, p, n, vtv, k, t, `{path}[{n}{path}]`, tables))}`
+                size -= 1
+                continue
+            end
+            local currentPath = "" -- initializes the path of 'v' within 't'
+            if type(k) == "string" and k:match("^[%a_]+[%w_]*$") then -- cleanly handles table path generation (for the first half)
+                currentPath = "." .. k
+            else
+                currentPath = "[" .. v2s(k, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. "]"
+            end
+            if size % 100 == 0 then
+                scheduleWait()
+            end
+            -- actually serializes the member of the table
+            s = s .. "\n" .. string.rep(" ", l) .. "[" .. v2s(k, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. "] = " .. v2s(v, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. ","
         end
-        local currentPath = "" -- initializes the path of 'v' within 't'
-        if type(k) == "string" and k:match("^[%a_]+[%w_]*$") then -- cleanly handles table path generation (for the first half)
-            currentPath = "." .. k
-        else
-            currentPath = "[" .. v2s(k, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. "]"
-        end
-        if size % 100 == 0 then
-            scheduleWait()
-        end
-        -- actually serializes the member of the table
-        s = s .. "\n" .. string.rep(" ", l) .. "[" .. v2s(k, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. "] = " .. v2s(v, l, p, n, vtv, k, t, path .. currentPath, tables, tI) .. ","
     end
     if #s > 1 then -- removes the last comma because it looks nicer (no way to tell if it's done 'till it's done so...)
         s = s:sub(1, #s - 1)
