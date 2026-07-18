@@ -19,14 +19,50 @@ local function getFullPath(instance)
 	if not instance then
 		return "nil"
 	end
-	local pathParts = {}
-	local serviceName = nil
+
 	local function isValidIdentifier(name)
 		return name:match("^[%a_][%w_]*$") ~= nil
 	end
 	local function formatLuaString(name)
-		return "[\" .. name .. \"]"
+		return "[\" .. name .. "\"]"
 	end
+
+	-- === Smart equipped tool detection ===
+	-- If the instance is currently under a character, generate a stable character-based path
+	do
+		local current = instance
+		local character = nil
+		while current do
+			if current:IsA("Model") and current:FindFirstChildOfClass("Humanoid") then
+				character = current
+				break
+			end
+			current = current.Parent
+		end
+
+		if character then
+			local charParts = {}
+			current = instance
+			while current and current ~= character and current ~= game do
+				local name = current.Name
+				local ref
+				if isValidIdentifier(name) then
+					ref = "." .. name
+				else
+					ref = formatLuaString(name)
+				end
+				table.insert(charParts, 1, ref)
+				current = current.Parent
+			end
+			local base = 'game:GetService("Players").LocalPlayer.Character'
+			return base .. table.concat(charParts, "")
+		end
+	end
+	-- === End smart detection ===
+
+	local pathParts = {}
+	local serviceName = nil
+
 	local function getInstanceReference(inst)
 		if not inst or inst == game then
 			return nil
@@ -53,7 +89,6 @@ local function getFullPath(instance)
 			end
 		end
 		if sameNameCount > 1 then
-			-- Use :GetChildren()[index] for duplicates (exactly what you wanted)
 			return ":GetChildren()[" .. myIndex .. "]"
 		else
 			if isValidIdentifier(name) then
@@ -63,6 +98,7 @@ local function getFullPath(instance)
 			end
 		end
 	end
+
 	while instance and instance ~= game do
 		local parent = instance.Parent
 		local ref = getInstanceReference(instance)
@@ -81,6 +117,7 @@ local function getFullPath(instance)
 		end
 		instance = parent
 	end
+
 	if serviceName then
 		table.insert(pathParts, 1, "game:GetService(\"" .. serviceName .. "\")")
 	else
@@ -2156,34 +2193,31 @@ newButton(
 
 -- Executes the contents of the codebox through loadstring
 newButton("Run Code",
-    function() return "Click to execute code" end,
+    function() return "Click to execute the GENERATED code shown above (best for GetChildren() paths & tools)" end,
     function()
-        local Remote = selected and selected.Remote
-        if Remote then
-            TextLabel.Text = "Executing..."
-            xpcall(function()
-                local returnvalue
-                local returnValuesTable = {}  -- Table to store return values
-
-                if Remote:IsA("RemoteEvent") or Remote:IsA("UnreliableRemoteEvent") then
-                    returnvalue = Remote:FireServer(unpack(selected.args))
-                else
-                    returnvalue = Remote:InvokeServer(unpack(selected.args))
-                end
-
-                -- Insert the return value into the table
-                table.insert(returnValuesTable, returnvalue)
-
-                -- Set clipboard with the entire table (automatically converts to a string)
-                setclipboard(v2s(returnValuesTable))
-
-                TextLabel.Text = ("Executed successfully!\n%s"):format(v2s(returnvalue))
-            end, function(err)
-                TextLabel.Text = ("Execution error!\n%s"):format(err)
-            end)
+        local code = codebox:getString()
+        if not code or code == "" then
+            TextLabel.Text = "No code in the box to execute"
             return
         end
-        TextLabel.Text = "Source not found"
+
+        TextLabel.Text = "Executing generated code..."
+        local func, loadErr = loadstring(code)
+        if not func then
+            TextLabel.Text = "Syntax error:\n" .. tostring(loadErr)
+            return
+        end
+
+        local success, result = pcall(func)
+        if success then
+            TextLabel.Text = "Executed successfully!"
+            if result ~= nil then
+                -- Try to copy return value if any
+                pcall(function() setclipboard(v2s({result})) end)
+            end
+        else
+            TextLabel.Text = "Runtime error while executing:\n" .. tostring(result)
+        end
     end
 )
 
