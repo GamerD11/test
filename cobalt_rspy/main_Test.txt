@@ -4534,6 +4534,18 @@ local ReferencingTemplate = require(script.Parent.Templates.Referencing)
 local GetNilCode = ReferencingTemplate.GetNilCode
 
 local InstanceSerializer = require(script.Parent.Serializer.Instance)
+
+local function GetCallPathSnapshots(CallInfo)
+	local Cache = wax.shared.CallPathSnapshots
+	if not Cache or not CallInfo then
+		return nil
+	end
+
+	return Cache[CallInfo]
+		or (CallInfo.Arguments and Cache[CallInfo.Arguments])
+		or (CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
+end
+
 local ResolveEventPath
 do
 	--#region @export "FindEventReferenceInTable"
@@ -4669,6 +4681,12 @@ do
 	--#endregion
 
 	ResolveEventPath = function(CallInfo: Types.CallInfo): (string, string?)
+		local Snapshots = GetCallPathSnapshots(CallInfo)
+		local EventSnapshot = Snapshots and Snapshots.Event
+		if EventSnapshot then
+			return EventSnapshot.Code, EventSnapshot.Prelude
+		end
+
 		return InstanceSerializer.Serialize(CallInfo.Instance, {
 			VariableName = "Event",
 			DisableNilParentHandler = false,
@@ -4800,6 +4818,7 @@ function Renderer.DeriveVariables(
 			Prettify = true,
 			InsertCycles = true,
 			IsArray = true,
+			PathSnapshots = GetCallPathSnapshots(Data.CallInfo),
 		})
 
 		local ExpectedResult, ExpectedResultRequiresNilHandler = nil, false
@@ -4819,6 +4838,7 @@ function Renderer.DeriveVariables(
 				Prettify = true,
 				InsertCycles = true,
 				IsArray = true,
+				PathSnapshots = GetCallPathSnapshots(Data.CallInfo),
 			})
 
 			Variables.ExpectedResultCode = "\n\nlocal ExpectedResult = table.unpack(" .. ExpectedResult .. ")\n"
@@ -5160,7 +5180,8 @@ end)() end,
 local table, string, next, pcall, game, workspace, tostring, tonumber, getmetatable =
     table, string, next, pcall, game, workspace, tostring, tonumber, getmetatable
 
-local SerializeInstance = require(script.Parent.Instance).Serialize
+local InstanceSerializer = require(script.Parent.Instance)
+local SerializeInstance = InstanceSerializer.Serialize
 
 local string_pack = string.pack
 local string_byte = string.byte
@@ -5353,6 +5374,7 @@ local function LuaEncode(inputTable, options)
     CheckType(options.SerializeMathHuge, "options.SerializeMathHuge", "boolean", "nil")
     CheckType(options.DisableNilParentHandler, "options.DisableNilParentHandler", "boolean", "nil")
     CheckType(options.IsArray, "options.IsArray", "boolean", "nil")
+    CheckType(options.PathSnapshots, "options.PathSnapshots", "table", "nil")
 
     CheckType(options._StackLevel, "options._StackLevel", "number", "nil")
     CheckType(options._VisitedTables, "options._VisitedTables", "table", "nil")
@@ -5368,6 +5390,7 @@ local function LuaEncode(inputTable, options)
     local DisableNilParentHandler = options.DisableNilParentHandler or false
     local SerializeMathHuge = (options.SerializeMathHuge == nil and true) or options.SerializeMathHuge
     local IsArray = (options.IsArray == nil and false) or options.IsArray
+    local PathSnapshots = options.PathSnapshots
 
     local StackLevelOpt = options._StackLevel or 1
     local VisitedTables = options._VisitedTables or {} -- [Ref: table] = true
@@ -5694,9 +5717,42 @@ local function LuaEncode(inputTable, options)
             return "Content.none" .. BlankSeperator .. CommentBlock("Content source=" .. tostring(source))
         end
 
-        -- Instance refs can be evaluated to their paths (optional), but if parented to
-        -- nil or some DataModel not under `game`, it'll just return nil
+        local function FindCapturedInstancePath(Target: Instance)
+            local CapturedInstances = PathSnapshots and PathSnapshots.Instances
+            if not CapturedInstances then
+                return nil
+            end
+
+            for _, Snapshot in CapturedInstances do
+                if rawequal(Snapshot.Reference, Target) then
+                    return Snapshot
+                end
+
+                local Success, IsEqual = pcall(
+                    InstanceSerializer.IsEqualToInstance,
+                    Snapshot.Reference,
+                    Target
+                )
+                if Success and IsEqual then
+                    return Snapshot
+                end
+            end
+
+            return nil
+        end
+
+        -- Instance refs use their call-time snapshot first. Only calls created
+        -- before this patch, or values added after logging, use the live parent.
         TypeCases["Instance"] = function(value)
+            local Snapshot = FindCapturedInstancePath(value)
+            if Snapshot then
+                if Snapshot.Prelude then
+                    DidInsertNilFunction = true
+                end
+
+                return Snapshot.Code
+            end
+
             if UseInstancePaths then
                 local InstancePath, NilFunctionInserted = SerializeInstance(value, {
                     DisableNilParentHandler = DisableNilParentHandler,
@@ -5710,8 +5766,6 @@ local function LuaEncode(inputTable, options)
                 if InstancePath then
                     return InstancePath
                 end
-
-                -- ^^ Now, if the path isn't accessable, falls back to the return below anyway
             end
 
             return "nil"
@@ -9674,6 +9728,104 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
+local InstanceSerializer = require("@src/Utils/CodeGen/Serializer/Instance")
+
+-- Paths are captured synchronously when a call is logged. The cache uses weak
+-- keys so clearing a call also allows its path snapshots to be collected.
+wax.shared.CallPathSnapshots = wax.shared.CallPathSnapshots
+	or setmetatable({}, { __mode = "k" })
+
+local function InstancesEqual(First: Instance, Second: Instance): boolean
+	if rawequal(First, Second) then
+		return true
+	end
+
+	local Success, Result = pcall(InstanceSerializer.IsEqualToInstance, First, Second)
+	return Success and Result == true
+end
+
+local function FindCapturedInstance(Snapshots, Target: Instance)
+	for _, Snapshot in Snapshots do
+		if InstancesEqual(Snapshot.Reference, Target) then
+			return Snapshot
+		end
+	end
+
+	return nil
+end
+
+local function SerializeInstanceAtCallTime(Target: Instance, VariableName: string?)
+	if typeof(Target) ~= "Instance" then
+		return nil
+	end
+
+	local Success, Code, Prelude = pcall(InstanceSerializer.Serialize, Target, {
+		VariableName = VariableName,
+		DisableNilParentHandler = false,
+		OmitNilFunctionGetterCodeGeneration = true,
+		IgnorePlugins = true,
+	})
+
+	if not Success or type(Code) ~= "string" or Code == "" then
+		return nil
+	end
+
+	return {
+		Reference = Target,
+		Code = Code,
+		Prelude = Prelude,
+	}
+end
+
+local function CaptureInstancePaths(Value, Snapshots, VisitedTables)
+	if typeof(Value) == "Instance" then
+		if FindCapturedInstance(Snapshots, Value) then
+			return
+		end
+
+		local Snapshot = SerializeInstanceAtCallTime(Value)
+		if Snapshot then
+			table.insert(Snapshots, Snapshot)
+		end
+		return
+	end
+
+	if type(Value) ~= "table" or VisitedTables[Value] then
+		return
+	end
+
+	VisitedTables[Value] = true
+	for Key, ChildValue in next, Value do
+		CaptureInstancePaths(Key, Snapshots, VisitedTables)
+		CaptureInstancePaths(ChildValue, Snapshots, VisitedTables)
+	end
+end
+
+local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
+	local Cache = wax.shared.CallPathSnapshots
+	local CacheKey = CallInfo.Arguments or CallInfo
+	local Snapshots = Cache[CacheKey]
+
+	if not Snapshots then
+		Snapshots = {
+			Event = SerializeInstanceAtCallTime(RemoteInstance, "Event"),
+			Instances = {},
+		}
+		Cache[CacheKey] = Snapshots
+	end
+
+	-- Also map the full CallInfo for normal UI code paths. Cobalt's file logger
+	-- wraps CallInfo, so Renderer can fall back to the Arguments key.
+	Cache[CallInfo] = Snapshots
+	if CallInfo.InvokeResult then
+		Cache[CallInfo.InvokeResult] = Snapshots
+	end
+
+	local VisitedTables = {}
+	CaptureInstancePaths(CallInfo.Arguments, Snapshots.Instances, VisitedTables)
+	CaptureInstancePaths(CallInfo.InvokeResult, Snapshots.Instances, VisitedTables)
+end
+
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
 --// Log Call Queue \\--
@@ -10061,6 +10213,10 @@ function Log:Call(RawInfo): number?
 	--// Info stuff \\--
 	local Info = DeepClone(RawInfo)
 	Info.CreationTime = tick()
+
+	-- Capture paths before the scheduler, UI, or game code can reparent the
+	-- remote or any Instance contained in the arguments/results.
+	CaptureCallPaths(Info, self.Instance)
 
 	--// Actor Relaying \\--
 	if wax.shared.IS_ACTOR then
