@@ -4278,6 +4278,547 @@ end
 CodeGen.GetFullPath = InstanceSerializer.Serialize
 
 
+-- SimpleSpy-compatible outgoing call serializer.
+--
+-- This is intentionally isolated to generated replay code. It does not replace
+-- Cobalt's general-purpose LuaEncode serializer and it never executes from the
+-- active remote hook. That keeps the hook return path untouched while matching
+-- SimpleSpy's argument formatting, table reconstruction and value filters.
+local function GetSimpleSpyCompatConfig()
+	local Environment = getgenv()
+	local Config = Environment.CobaltSimpleSpyConfig
+
+	if type(Config) ~= "table" then
+		Config = {}
+		Environment.CobaltSimpleSpyConfig = Config
+	end
+
+	if Config.Enabled == nil then Config.Enabled = true end
+	if Config.SerializerEnabled == nil then Config.SerializerEnabled = true end
+	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.AutoBlock == nil then Config.AutoBlock = false end
+	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
+	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
+	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
+	if type(Config.MaxTableSize) ~= "number" then Config.MaxTableSize = 1000 end
+	if type(Config.MaxStringSize) ~= "number" then Config.MaxStringSize = 10000 end
+	if Config.PreserveNilArguments == nil then Config.PreserveNilArguments = true end
+
+	return Config
+end
+
+local function GetCallPathSnapshots(CallInfo)
+	local Cache = wax.shared.CallPathSnapshots
+	if not Cache then
+		return nil
+	end
+
+	return Cache[CallInfo]
+		or (CallInfo.Arguments and Cache[CallInfo.Arguments])
+		or (CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
+end
+
+local function BuildSimpleSpyCallCode(CallInfo, Scenario)
+	local Config = GetSimpleSpyCompatConfig()
+	local Snapshots = GetCallPathSnapshots(CallInfo)
+	local IndentSize = 4
+	local TopStrings = {}
+	local TopStringLookup = {}
+	local BottomString = ""
+	local GetNilRequired = false
+	local MaxTableSize = math.max(1, math.floor(Config.MaxTableSize))
+	local MaxStringSize = math.max(1, math.floor(Config.MaxStringSize))
+
+	local function AddPrelude(Prelude)
+		if type(Prelude) ~= "string" or Prelude == "" or TopStringLookup[Prelude] then
+			return
+		end
+
+		TopStringLookup[Prelude] = true
+		table.insert(TopStrings, Prelude)
+	end
+
+	local function GetSnapshotForInstance(Target)
+		local InstanceSnapshots = Snapshots and Snapshots.Instances
+		if not InstanceSnapshots then
+			return nil
+		end
+
+		local Direct = InstanceSnapshots[Target]
+		if Direct then
+			return Direct
+		end
+
+		for Reference, Snapshot in next, InstanceSnapshots do
+			local Success, Matches = pcall(InstanceSerializer.IsEqualToInstance, Reference, Target)
+			if Success and Matches then
+				return Snapshot
+			end
+		end
+
+		return nil
+	end
+
+	local function GetInstancePath(Target)
+		local Snapshot = GetSnapshotForInstance(Target)
+		if Snapshot and type(Snapshot.Code) == "string" then
+			AddPrelude(Snapshot.Prelude)
+			if Snapshot.Prelude then
+				GetNilRequired = true
+			end
+			return Snapshot.Code
+		end
+
+		local Success, Path, Prelude = pcall(InstanceSerializer.Serialize, Target, {
+			DisableNilParentHandler = false,
+			OmitNilFunctionGetterCodeGeneration = true,
+			IgnorePlugins = true,
+		})
+
+		if Success and type(Path) == "string" then
+			AddPrelude(Prelude)
+			if Prelude then
+				GetNilRequired = true
+			end
+			return Path
+		end
+
+		return "nil --[[Instance path generation failed]]"
+	end
+
+	local function GetRemotePath()
+		local EventSnapshot = Snapshots and Snapshots.Event
+		if EventSnapshot and type(EventSnapshot.Code) == "string" then
+			AddPrelude(EventSnapshot.Prelude)
+			if EventSnapshot.Prelude then
+				GetNilRequired = true
+			end
+
+			return (EventSnapshot.Code:gsub("^local%s+Event%s*=%s*", "", 1))
+		end
+
+		return GetInstancePath(CallInfo.Instance)
+	end
+
+	local function RawToString(Value)
+		local Success, Result = pcall(tostring, Value)
+		return Success and Result or "<tostring failed>"
+	end
+
+	local function FormatString(Value, Indentation)
+		Indentation = Indentation or 0
+		local Limit = math.min(#Value, MaxStringSize)
+		local Result = {}
+		local SourceCharacters = 0
+
+		for Index = 1, Limit do
+			local Byte = string.byte(Value, Index)
+			local Character = string.char(Byte)
+			local Encoded
+
+			if Character == "\n" then
+				Encoded = "\\n"
+			elseif Character == "\t" then
+				Encoded = "\\t"
+			elseif Character == "\r" then
+				Encoded = "\\r"
+			elseif Character == "\\" then
+				Encoded = "\\\\"
+			elseif Character == '"' then
+				Encoded = '\\"'
+			elseif Byte < 32 or Byte > 126 then
+				Encoded = "\\" .. tostring(Byte)
+			else
+				Encoded = Character
+			end
+
+			table.insert(Result, Encoded)
+			SourceCharacters += 1
+
+			if SourceCharacters % 100 == 0 and Index < Limit then
+				table.insert(Result, '" ..\n' .. string.rep(" ", Indentation + IndentSize) .. '"')
+			end
+		end
+
+		local Suffix = ""
+		if #Value > MaxStringSize then
+			Suffix =
+				" --[[ MAXIMUM STRING SIZE REACHED, CHANGE "
+				.. "'getgenv().CobaltSimpleSpyConfig.MaxStringSize' TO ADJUST MAXIMUM SIZE ]]"
+		end
+
+		return '"' .. table.concat(Result) .. '"' .. Suffix
+	end
+
+	local NumberConstants = {
+		["inf"] = "math.huge",
+		["-inf"] = "-math.huge",
+		["nan"] = "0/0",
+	}
+
+	local ValueToString
+	local TableToString
+	local ValueToPath
+
+	local function SerializeFunction(Value)
+		local Name = ""
+		pcall(function()
+			Name = debug.info(Value, "n") or ""
+		end)
+
+		if Name ~= "" and string.match(Name, "^[%a_][%w_]*$") then
+			return "function " .. Name .. "() end -- Function Called: " .. Name
+		end
+
+		return "function() end --[[Unsupported function: " .. RawToString(Value) .. "]]"
+	end
+
+	local function SerializeRobloxValue(Value, RobloxType)
+		if RobloxType == "Vector3" then
+			return string.format("Vector3.new(%s, %s, %s)", tostring(Value.X), tostring(Value.Y), tostring(Value.Z))
+		elseif RobloxType == "Vector2" then
+			return string.format("Vector2.new(%s, %s)", tostring(Value.X), tostring(Value.Y))
+		elseif RobloxType == "CFrame" then
+			local Components = { Value:GetComponents() }
+			for Index, Component in Components do
+				Components[Index] = tostring(Component)
+			end
+			return "CFrame.new(" .. table.concat(Components, ", ") .. ")"
+		elseif RobloxType == "Color3" then
+			return string.format("Color3.new(%s, %s, %s)", tostring(Value.R), tostring(Value.G), tostring(Value.B))
+		elseif RobloxType == "UDim" then
+			return string.format("UDim.new(%s, %s)", tostring(Value.Scale), tostring(Value.Offset))
+		elseif RobloxType == "UDim2" then
+			return string.format(
+				"UDim2.new(%s, %s, %s, %s)",
+				tostring(Value.X.Scale),
+				tostring(Value.X.Offset),
+				tostring(Value.Y.Scale),
+				tostring(Value.Y.Offset)
+			)
+		elseif RobloxType == "Rect" then
+			return string.format(
+				"Rect.new(%s, %s, %s, %s)",
+				tostring(Value.Min.X),
+				tostring(Value.Min.Y),
+				tostring(Value.Max.X),
+				tostring(Value.Max.Y)
+			)
+		elseif RobloxType == "Ray" then
+			return "Ray.new(" .. SerializeRobloxValue(Value.Origin, "Vector3")
+				.. ", " .. SerializeRobloxValue(Value.Direction, "Vector3") .. ")"
+		elseif RobloxType == "BrickColor" then
+			return "BrickColor.new(" .. tostring(Value.Number) .. ")"
+		elseif RobloxType == "NumberRange" then
+			return string.format("NumberRange.new(%s, %s)", tostring(Value.Min), tostring(Value.Max))
+		elseif RobloxType == "TweenInfo" then
+			return string.format(
+				"TweenInfo.new(%s, %s, %s, %s, %s, %s)",
+				tostring(Value.Time),
+				tostring(Value.EasingStyle),
+				tostring(Value.EasingDirection),
+				tostring(Value.RepeatCount),
+				tostring(Value.Reverses),
+				tostring(Value.DelayTime)
+			)
+		elseif RobloxType == "Region3" then
+			local Center = Value.CFrame.Position
+			local HalfSize = Value.Size / 2
+			return "Region3.new("
+				.. SerializeRobloxValue(Center - HalfSize, "Vector3")
+				.. ", "
+				.. SerializeRobloxValue(Center + HalfSize, "Vector3")
+				.. ")"
+		elseif RobloxType == "Faces" then
+			local Faces = {}
+			for _, Name in { "Top", "Bottom", "Left", "Right", "Back", "Front" } do
+				if Value[Name] then
+					table.insert(Faces, "Enum.NormalId." .. Name)
+				end
+			end
+			return "Faces.new(" .. table.concat(Faces, ", ") .. ")"
+		elseif RobloxType == "PathWaypoint" then
+			return "PathWaypoint.new("
+				.. SerializeRobloxValue(Value.Position, "Vector3")
+				.. ", " .. tostring(Value.Action)
+				.. ", " .. FormatString(Value.Label or "", 0)
+				.. ")"
+		elseif RobloxType == "EnumItem" or RobloxType == "Enums" or RobloxType == "Enum" then
+			return tostring(Value)
+		elseif RobloxType == "RBXScriptSignal" then
+			return "nil --[[RBXScriptSignal values cannot be sent to the server]]"
+		elseif RobloxType == "RBXScriptConnection" then
+			return "nil --[[RBXScriptConnection values cannot be sent to the server]]"
+		elseif RobloxType == "buffer" and buffer and buffer.tostring then
+			local Success, BufferString = pcall(buffer.tostring, Value)
+			if Success then
+				return "buffer.fromstring(" .. FormatString(BufferString, 0) .. ")"
+			end
+		elseif RobloxType == "Instance" then
+			return GetInstancePath(Value)
+		end
+
+		return nil
+	end
+
+	ValueToPath = function(Target, SearchTable, Path, Visited)
+		Path = Path or ""
+		Visited = Visited or {}
+
+		if rawequal(Target, SearchTable) then
+			return true, ""
+		end
+		if Visited[SearchTable] then
+			return false, ""
+		end
+		Visited[SearchTable] = true
+
+		for Key, Value in next, SearchTable do
+			local KeyPath
+			if type(Key) == "string" and string.match(Key, "^[%a_][%w_]*$") then
+				KeyPath = "." .. Key
+			else
+				KeyPath = "[" .. ValueToString(Key) .. "]"
+			end
+
+			if rawequal(Value, Target) then
+				return true, Path .. KeyPath
+			end
+
+			if type(Value) == "table" then
+				local Found, ChildPath = ValueToPath(Target, Value, Path .. KeyPath, Visited)
+				if Found then
+					return true, ChildPath
+				end
+			end
+		end
+
+		return false, ""
+	end
+
+	TableToString = function(CurrentTable, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		Path = Path or ""
+		Level = Level or 0
+		ParentTable = ParentTable or CurrentTable
+		Tables = Tables or {}
+
+		for _, Previous in next, Tables do
+			if VariableName and rawequal(Previous, CurrentTable) then
+				local _, ExistingPath = ValueToPath(CurrentTable, ParentTable)
+				BottomString = BottomString
+					.. "\n"
+					.. tostring(VariableName)
+					.. tostring(Path)
+					.. " = "
+					.. tostring(VariableName)
+					.. tostring(ExistingPath)
+				return "{} --[[DUPLICATE]]"
+			end
+		end
+
+		table.insert(Tables, CurrentTable)
+
+		local Output = "{"
+		local Size = 0
+		local ChildLevel = Level + IndentSize
+
+		local MaximumNumericIndex = 0
+		local PureNumeric = true
+		for Key in next, CurrentTable do
+			if type(Key) == "number" and Key > 0 and Key == math.floor(Key) then
+				MaximumNumericIndex = math.max(MaximumNumericIndex, Key)
+			else
+				PureNumeric = false
+				break
+			end
+		end
+
+		if PureNumeric and MaximumNumericIndex > 0 then
+			for NumericIndex = 1, MaximumNumericIndex do
+				Size += 1
+				if Size > MaxTableSize then
+					Output = Output
+						.. "\n"
+						.. string.rep(" ", ChildLevel)
+						.. "-- MAXIMUM TABLE SIZE REACHED, CHANGE "
+						.. "'getgenv().CobaltSimpleSpyConfig.MaxTableSize' TO ADJUST MAXIMUM SIZE "
+					break
+				end
+
+				local Value = CurrentTable[NumericIndex]
+				local ValueString = Value == nil and "nil"
+					or ValueToString(
+						Value,
+						ChildLevel,
+						ParentTable,
+						VariableName,
+						IsVariable,
+						NumericIndex,
+						CurrentTable,
+						Path .. "[" .. tostring(NumericIndex) .. "]",
+						Tables
+					)
+
+				Output = Output
+					.. "\n"
+					.. string.rep(" ", ChildLevel)
+					.. "["
+					.. tostring(NumericIndex)
+					.. "] = "
+					.. ValueString
+					.. ","
+			end
+		else
+			for Key, Value in next, CurrentTable do
+				Size += 1
+				if Size > MaxTableSize then
+					Output = Output
+						.. "\n"
+						.. string.rep(" ", ChildLevel)
+						.. "-- MAXIMUM TABLE SIZE REACHED, CHANGE "
+						.. "'getgenv().CobaltSimpleSpyConfig.MaxTableSize' TO ADJUST MAXIMUM SIZE "
+					break
+				end
+
+				if rawequal(Key, CurrentTable) then
+					local ValueString = rawequal(Value, Key)
+							and (tostring(VariableName) .. tostring(Path))
+						or ValueToString(Value, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path, Tables)
+					BottomString = BottomString
+						.. "\n"
+						.. tostring(VariableName)
+						.. tostring(Path)
+						.. "["
+						.. tostring(VariableName)
+						.. tostring(Path)
+						.. "] = "
+						.. ValueString
+					Size -= 1
+					continue
+				end
+
+				local CurrentPath
+				if type(Key) == "string" and string.match(Key, "^[%a_][%w_]*$") then
+					CurrentPath = "." .. Key
+				else
+					CurrentPath = "[" .. ValueToString(Key) .. "]"
+				end
+
+				Output = Output
+					.. "\n"
+					.. string.rep(" ", ChildLevel)
+					.. "["
+					.. ValueToString(Key, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path .. CurrentPath, Tables)
+					.. "] = "
+					.. ValueToString(Value, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path .. CurrentPath, Tables)
+					.. ","
+			end
+		end
+
+		if string.sub(Output, -1) == "," then
+			Output = string.sub(Output, 1, -2)
+		end
+		if Size > 0 then
+			Output = Output .. "\n" .. string.rep(" ", Level)
+		end
+
+		return Output .. "}"
+	end
+
+	ValueToString = function(Value, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		local RobloxType = typeof(Value)
+		local LuaType = type(Value)
+
+		if Value == nil then
+			return "nil"
+		elseif RobloxType == "Instance" then
+			return GetInstancePath(Value)
+		elseif LuaType == "number" then
+			return NumberConstants[tostring(Value)] or tostring(Value)
+		elseif LuaType == "boolean" then
+			return tostring(Value)
+		elseif LuaType == "string" then
+			return FormatString(Value, Level or 0)
+		elseif LuaType == "table" then
+			return TableToString(Value, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		elseif LuaType == "function" then
+			return SerializeFunction(Value)
+		end
+
+		local RobloxValue = SerializeRobloxValue(Value, RobloxType)
+		if RobloxValue then
+			return RobloxValue
+		end
+
+		if LuaType == "userdata" then
+			return "newproxy(true)"
+		elseif LuaType == "thread" then
+			return "nil --[[thread values cannot be sent to the server]]"
+		end
+
+		return "nil --[[Generation Failure: " .. tostring(RobloxType) .. " (" .. RawToString(Value) .. ")]]"
+	end
+
+	local function ValueToVariable(Name, Value)
+		local Result = "local " .. Name .. " = " .. ValueToString(Value, nil, nil, Name, true) .. "\n"
+		if BottomString ~= "" then
+			Result = Result .. BottomString .. "\n"
+		end
+
+		return Result
+	end
+
+	local Arguments = Scenario.Arguments or CallInfo.Arguments or {}
+	local ArgumentCount = Arguments.n or #Arguments
+	local ArgumentsForSerialization = {}
+	for Key, Value in next, Arguments do
+		if Key ~= "n" then
+			ArgumentsForSerialization[Key] = Value
+		end
+	end
+
+	local RemotePath = GetRemotePath()
+	local Method = Scenario.Method or wax.shared.FunctionForClasses.Outgoing[CallInfo.Instance.ClassName]
+	if type(Method) ~= "string" then
+		error("SimpleSpy serializer could not resolve the outgoing method")
+	end
+
+	local Generated = ""
+	if ArgumentCount > 0 then
+		Generated = ValueToVariable("args", ArgumentsForSerialization) .. "\n"
+
+		if Config.PreserveNilArguments then
+			Generated = Generated
+				.. RemotePath
+				.. ":"
+				.. Method
+				.. "(unpack(args, 1, "
+				.. tostring(ArgumentCount)
+				.. "))"
+		else
+			Generated = Generated .. RemotePath .. ":" .. Method .. "(unpack(args))"
+		end
+	else
+		Generated = RemotePath .. ":" .. Method .. "()"
+	end
+
+	if #TopStrings > 0 then
+		Generated = table.concat(TopStrings, "\n\n") .. "\n\n" .. Generated
+	elseif GetNilRequired then
+		Generated =
+			"function getNil(name,class) for _,v in next, getnilinstances() do "
+			.. "if v.ClassName==class and v.Name==name then return v end end end\n\n"
+			.. Generated
+	end
+
+	if CallInfo.Blocked then
+		Generated = "-- THIS REMOTE WAS PREVENTED FROM FIRING TO THE SERVER\n\n" .. Generated
+	end
+
+	return Generated
+end
+
+
 
 local function CountValues(Values)
 	if type(Values) ~= "table" then
@@ -4355,6 +4896,24 @@ function CodeGen:BuildCallCode(CallInfo: Types.CallInfo)
 
 	--// Determine Scenario \\--
 	local Scenario = Classifier.DetermineScenario(CallInfo)
+
+	-- SimpleSpy-compatible generation is used only for outgoing replay calls.
+	-- Incoming hook/callback code still uses Cobalt's native renderer.
+	local SimpleSpyConfig = GetSimpleSpyCompatConfig()
+	if
+		SimpleSpyConfig.Enabled
+		and SimpleSpyConfig.SerializerEnabled
+		and Scenario.Type == "Outgoing"
+	then
+		local Success, Generated = xpcall(BuildSimpleSpyCallCode, function(Error)
+			warn("Cobalt SimpleSpy serializer failed; falling back to native generation:", Error)
+			return Error
+		end, CallInfo, Scenario)
+
+		if Success and type(Generated) == "string" then
+			return BuildCodeGenHeader() .. Generated
+		end
+	end
 
 	--// Resolve Template \\--
 	local Template = Renderer.ResolveTemplate("Call", Scenario)
@@ -9927,6 +10486,112 @@ end
 
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
 
+
+local function GetSimpleSpyCompatConfig()
+	local Environment = getgenv()
+	local Config = Environment.CobaltSimpleSpyConfig
+
+	if type(Config) ~= "table" then
+		Config = {}
+		Environment.CobaltSimpleSpyConfig = Config
+	end
+
+	if Config.Enabled == nil then Config.Enabled = true end
+	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.AutoBlock == nil then Config.AutoBlock = false end
+	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
+	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
+	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
+
+	return Config
+end
+
+local function GetRemoteDebugId(Remote)
+	if typeof(Remote) ~= "Instance" then
+		return nil
+	end
+
+	local Success, Result = pcall(function()
+		local GetDebugId = Remote.GetDebugId
+		return GetDebugId(Remote)
+	end)
+
+	return Success and type(Result) == "string" and Result or nil
+end
+
+local function SimpleSpyFilterMatches(FilterTable, Remote, DebugId)
+	if type(FilterTable) ~= "table" or typeof(Remote) ~= "Instance" then
+		return false
+	end
+
+	if FilterTable[Remote] or FilterTable[Remote.Name] or (DebugId and FilterTable[DebugId]) then
+		return true
+	end
+
+	for _, Entry in next, FilterTable do
+		if
+			rawequal(Entry, Remote)
+			or Entry == Remote
+			or Entry == Remote.Name
+			or (DebugId and Entry == DebugId)
+		then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function ResolveSimpleSpyFilterDecision(LogObject, Info)
+	local Config = GetSimpleSpyCompatConfig()
+	if not Config.Enabled then
+		return {
+			Ignore = false,
+			Block = false,
+			CompatibilityBlock = false,
+		}
+	end
+
+	local Remote = LogObject.Instance
+	local DebugId = GetRemoteDebugId(Remote)
+
+	return {
+		Ignore = SimpleSpyFilterMatches(Config.Blacklist, Remote, DebugId),
+		Block = Config.BlockAllRemotes == true or SimpleSpyFilterMatches(Config.Blocklist, Remote, DebugId),
+		CompatibilityBlock = Config.BlockAllRemotes == true or SimpleSpyFilterMatches(Config.Blocklist, Remote, DebugId),
+	}
+end
+
+local function IsSimpleSpySpam(LogObject)
+	local Config = GetSimpleSpyCompatConfig()
+	if not Config.Enabled or not Config.AutoBlock then
+		return false
+	end
+
+	local Now = tick()
+	LogObject.SimpleSpyLastCall = LogObject.SimpleSpyLastCall or 0
+	LogObject.SimpleSpyBadOccurrences = LogObject.SimpleSpyBadOccurrences or 0
+
+	if LogObject.SimpleSpyAutoExcluded then
+		return true
+	end
+
+	if Now - LogObject.SimpleSpyLastCall < 1 then
+		LogObject.SimpleSpyBadOccurrences += 1
+		LogObject.SimpleSpyLastCall = Now
+
+		if LogObject.SimpleSpyBadOccurrences > 3 then
+			LogObject.SimpleSpyAutoExcluded = true
+		end
+
+		return true
+	end
+
+	LogObject.SimpleSpyLastCall = Now
+	LogObject.SimpleSpyBadOccurrences = 0
+	return false
+end
+
 --// Log Call Queue \\--
 wax.shared.LogNotificationQueue = {
 	Items = {},
@@ -10276,7 +10941,13 @@ function Log:ShouldBlock(RawInfo): boolean
 		FilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)
 	end
 
-	local ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == "Block"
+	local SimpleSpyDecision = ResolveSimpleSpyFilterDecision(self, RawInfo)
+	local ShouldBlock =
+		RawInfo.Blocked == true
+		or self.Blocked
+		or FilterAction == "Block"
+		or SimpleSpyDecision.Block
+
 	if ShouldBlock then
 		RawInfo.Blocked = true
 	end
@@ -10284,6 +10955,8 @@ function Log:ShouldBlock(RawInfo): boolean
 	PendingCallDecisions[RawInfo] = {
 		FilterAction = FilterAction,
 		ShouldBlock = ShouldBlock,
+		SimpleSpyIgnore = SimpleSpyDecision.Ignore,
+		SimpleSpyCompatibilityBlock = SimpleSpyDecision.CompatibilityBlock,
 	}
 	return ShouldBlock
 end
@@ -10293,8 +10966,26 @@ function Log:Call(RawInfo): number?
 	local Decision = PendingCallDecisions[RawInfo]
 	PendingCallDecisions[RawInfo] = nil
 
+	local SimpleSpyConfig = GetSimpleSpyCompatConfig()
+	if
+		SimpleSpyConfig.Enabled
+		and RawInfo.IsExecutor == true
+		and not SimpleSpyConfig.LogCheckCaller
+	then
+		return nil
+	end
+
+	if Decision.SimpleSpyIgnore then
+		return nil
+	end
+
+	if not wax.shared.IS_ACTOR and IsSimpleSpySpam(self) then
+		return nil
+	end
+
 	local ShouldCapture = if ShouldBlock
-		then wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
+		then Decision.SimpleSpyCompatibilityBlock
+			or wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
 		else not self.Ignored and Decision.FilterAction ~= "Ignore"
 
 	if not ShouldCapture then
