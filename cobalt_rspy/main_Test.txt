@@ -5180,8 +5180,7 @@ end)() end,
 local table, string, next, pcall, game, workspace, tostring, tonumber, getmetatable =
     table, string, next, pcall, game, workspace, tostring, tonumber, getmetatable
 
-local InstanceSerializer = require(script.Parent.Instance)
-local SerializeInstance = InstanceSerializer.Serialize
+local SerializeInstance = require(script.Parent.Instance).Serialize
 
 local string_pack = string.pack
 local string_byte = string.byte
@@ -5717,34 +5716,13 @@ local function LuaEncode(inputTable, options)
             return "Content.none" .. BlankSeperator .. CommentBlock("Content source=" .. tostring(source))
         end
 
-        local function FindCapturedInstancePath(Target: Instance)
-            local CapturedInstances = PathSnapshots and PathSnapshots.Instances
-            if not CapturedInstances then
-                return nil
-            end
-
-            for _, Snapshot in CapturedInstances do
-                if rawequal(Snapshot.Reference, Target) then
-                    return Snapshot
-                end
-
-                local Success, IsEqual = pcall(
-                    InstanceSerializer.IsEqualToInstance,
-                    Snapshot.Reference,
-                    Target
-                )
-                if Success and IsEqual then
-                    return Snapshot
-                end
-            end
-
-            return nil
-        end
-
-        -- Instance refs use their call-time snapshot first. Only calls created
-        -- before this patch, or values added after logging, use the live parent.
+        -- Use the immutable path captured while the remote call was still active.
+        -- The snapshot map is keyed by the exact cloned Instance stored in CallInfo.
         TypeCases["Instance"] = function(value)
-            local Snapshot = FindCapturedInstancePath(value)
+            local Snapshot = PathSnapshots
+                and PathSnapshots.Instances
+                and PathSnapshots.Instances[value]
+
             if Snapshot then
                 if Snapshot.Prelude then
                     DidInsertNilFunction = true
@@ -5766,6 +5744,8 @@ local function LuaEncode(inputTable, options)
                 if InstancePath then
                     return InstancePath
                 end
+
+                -- ^^ Now, if the path isn't accessable, falls back to the return below anyway
             end
 
             return "nil"
@@ -9728,64 +9708,185 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
-local InstanceSerializer = require("@src/Utils/CodeGen/Serializer/Instance")
+local GetNilCode = require("@src/Utils/CodeGen/Templates/Referencing").GetNilCode
 
--- Paths are captured synchronously when a call is logged. The cache uses weak
--- keys so clearing a call also allows its path snapshots to be collected.
+-- Call-time paths must be captured without invoking Instance methods through
+-- ':' syntax. A nested engine namecall inside the active __namecall hook can
+-- overwrite getnamecallmethod() and corrupt the original FireServer/InvokeServer.
 wax.shared.CallPathSnapshots = wax.shared.CallPathSnapshots
 	or setmetatable({}, { __mode = "k" })
 
-local function InstancesEqual(First: Instance, Second: Instance): boolean
-	if rawequal(First, Second) then
-		return true
-	end
-
-	local Success, Result = pcall(InstanceSerializer.IsEqualToInstance, First, Second)
-	return Success and Result == true
+local function Quote(Value): string
+	return string.format("%q", tostring(Value))
 end
 
-local function FindCapturedInstance(Snapshots, Target: Instance)
-	for _, Snapshot in Snapshots do
-		if InstancesEqual(Snapshot.Reference, Target) then
-			return Snapshot
+local function BuildStaticAccessor(Name: string, LookupMode: string): string
+	if LookupMode == "WaitForChild" then
+		return ":WaitForChild(" .. Quote(Name) .. ")"
+	elseif LookupMode == "FindFirstChild" then
+		return ":FindFirstChild(" .. Quote(Name) .. ")"
+	elseif string.match(Name, "^[%a_][%w_]*$") then
+		return "." .. Name
+	end
+
+	return "[" .. Quote(Name) .. "]"
+end
+
+local function ReadDebugId(Object: Instance): string?
+	local Success, Result = pcall(function()
+		local GetDebugId = Object.GetDebugId
+		return GetDebugId(Object)
+	end)
+
+	return Success and type(Result) == "string" and Result or nil
+end
+
+local function ReadChildren(Parent: Instance): { Instance }?
+	local Success, Result = pcall(function()
+		local GetChildren = Parent.GetChildren
+		return GetChildren(Parent)
+	end)
+
+	return Success and type(Result) == "table" and Result or nil
+end
+
+local function IsSameObject(First: Instance, Second: Instance): boolean
+	return rawequal(First, Second) or First == Second
+end
+
+local function IsLocalPlayerObject(Object: Instance): boolean
+	if Object.ClassName ~= "Player" then
+		return false
+	end
+
+	local Success, UserId = pcall(function()
+		return Object.UserId
+	end)
+
+	return Success and UserId == wax.shared.LocalPlayer.UserId
+end
+
+local function IsLocalCharacterObject(Object: Instance): boolean
+	local Parent = Object.Parent
+	if not Parent or Object.ClassName ~= "Model" or not IsLocalPlayerObject(Parent) then
+		return false
+	end
+
+	local Character = wax.shared.LocalPlayer.Character
+	return (Character and IsSameObject(Object, Character)) or Object.Name == wax.shared.LocalPlayer.Name
+end
+
+local function BuildChildAccessor(Current: Instance, Parent: Instance, Name: string, LookupMode: string): string
+	local Fallback = BuildStaticAccessor(Name, LookupMode)
+	local Children = ReadChildren(Parent)
+	if not Children then
+		return Fallback
+	end
+
+	local SameNameCount = 0
+	local AbsoluteIndex = nil
+	for Index, Child in Children do
+		if Child.Name == Name then
+			SameNameCount += 1
+		end
+
+		if IsSameObject(Child, Current) then
+			AbsoluteIndex = Index
 		end
 	end
 
-	return nil
+	-- cloneref can make direct equality unavailable. Only use DebugId when a
+	-- duplicate name actually requires disambiguation; call it as a direct
+	-- function so getnamecallmethod() remains untouched.
+	if SameNameCount > 1 and not AbsoluteIndex then
+		local CurrentDebugId = ReadDebugId(Current)
+		if CurrentDebugId then
+			for Index, Child in Children do
+				if Child.Name == Name and ReadDebugId(Child) == CurrentDebugId then
+					AbsoluteIndex = Index
+					break
+				end
+			end
+		end
+	end
+
+	if SameNameCount > 1 and AbsoluteIndex then
+		return ":GetChildren()[" .. tostring(AbsoluteIndex) .. "]"
+	end
+
+	return Fallback
 end
 
-local function SerializeInstanceAtCallTime(Target: Instance, VariableName: string?)
+local function BuildInstanceSnapshot(Target: Instance, VariableName: string?)
 	if typeof(Target) ~= "Instance" then
 		return nil
 	end
 
-	local Success, Code, Prelude = pcall(InstanceSerializer.Serialize, Target, {
-		VariableName = VariableName,
-		DisableNilParentHandler = false,
-		OmitNilFunctionGetterCodeGeneration = true,
-		IgnorePlugins = true,
-	})
+	local LookupMode = wax.shared.SaveManager.GetState(wax.shared.SaveManager, "InstancePathLookupChain")
+	local Parts = {}
+	local Current = Target
+	local Base = nil
+	local Prelude = nil
 
-	if not Success or type(Code) ~= "string" or Code == "" then
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" then
+			break
+		end
+
+		local Name = Current.Name
+		local ClassName = Current.ClassName
+		local Parent = Current.Parent
+
+		if ClassName == "DataModel" then
+			Base = "game"
+			break
+		elseif IsLocalCharacterObject(Current) then
+			Base = 'game:GetService("Players").LocalPlayer.Character'
+			break
+		elseif IsLocalPlayerObject(Current) then
+			Base = 'game:GetService("Players").LocalPlayer'
+			break
+		elseif Parent == nil then
+			local DebugId = ReadDebugId(Current)
+			if DebugId then
+				Base = "GetNil(" .. Quote(Name) .. ", " .. Quote(DebugId) .. ")"
+				Prelude = GetNilCode
+			else
+				Base = "nil --[[Nil parent: " .. string.gsub(tostring(Name), "%]%]", "] ]") .. "]]"
+			end
+			break
+		elseif Parent.ClassName == "DataModel" then
+			if ClassName == "Workspace" then
+				Base = "workspace"
+			else
+				Base = "game:GetService(" .. Quote(ClassName) .. ")"
+			end
+			break
+		else
+			table.insert(Parts, 1, BuildChildAccessor(Current, Parent, Name, LookupMode))
+			Current = Parent
+		end
+	end
+
+	if not Base then
 		return nil
 	end
 
+	local Code = Base .. table.concat(Parts)
+	if VariableName then
+		Code = "local " .. VariableName .. " = " .. Code
+	end
+
 	return {
-		Reference = Target,
 		Code = Code,
 		Prelude = Prelude,
 	}
 end
 
-local function CaptureInstancePaths(Value, Snapshots, VisitedTables)
+local function CaptureInstancePaths(Value, InstanceSnapshots, VisitedTables)
 	if typeof(Value) == "Instance" then
-		if FindCapturedInstance(Snapshots, Value) then
-			return
-		end
-
-		local Snapshot = SerializeInstanceAtCallTime(Value)
-		if Snapshot then
-			table.insert(Snapshots, Snapshot)
+		if InstanceSnapshots[Value] == nil then
+			InstanceSnapshots[Value] = BuildInstanceSnapshot(Value)
 		end
 		return
 	end
@@ -9796,8 +9897,8 @@ local function CaptureInstancePaths(Value, Snapshots, VisitedTables)
 
 	VisitedTables[Value] = true
 	for Key, ChildValue in next, Value do
-		CaptureInstancePaths(Key, Snapshots, VisitedTables)
-		CaptureInstancePaths(ChildValue, Snapshots, VisitedTables)
+		CaptureInstancePaths(Key, InstanceSnapshots, VisitedTables)
+		CaptureInstancePaths(ChildValue, InstanceSnapshots, VisitedTables)
 	end
 end
 
@@ -9808,14 +9909,12 @@ local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
 
 	if not Snapshots then
 		Snapshots = {
-			Event = SerializeInstanceAtCallTime(RemoteInstance, "Event"),
+			Event = BuildInstanceSnapshot(RemoteInstance, "Event"),
 			Instances = {},
 		}
 		Cache[CacheKey] = Snapshots
 	end
 
-	-- Also map the full CallInfo for normal UI code paths. Cobalt's file logger
-	-- wraps CallInfo, so Renderer can fall back to the Arguments key.
 	Cache[CallInfo] = Snapshots
 	if CallInfo.InvokeResult then
 		Cache[CallInfo.InvokeResult] = Snapshots
@@ -10214,9 +10313,10 @@ function Log:Call(RawInfo): number?
 	local Info = DeepClone(RawInfo)
 	Info.CreationTime = tick()
 
-	-- Capture paths before the scheduler, UI, or game code can reparent the
-	-- remote or any Instance contained in the arguments/results.
-	CaptureCallPaths(Info, self.Instance)
+	-- Never allow code-generation metadata to affect the intercepted call.
+	-- This runs synchronously to preserve the original ancestry, but all engine
+	-- methods inside the snapshotter use direct function calls instead of ':'.
+	pcall(CaptureCallPaths, Info, self.Instance)
 
 	--// Actor Relaying \\--
 	if wax.shared.IS_ACTOR then
