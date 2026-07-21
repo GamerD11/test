@@ -4275,7 +4275,17 @@ local function InvokePluginHandlers(Type: "Hook" | "Call", ShouldUseResult: (...
 	return true, nil
 end
 
-CodeGen.GetFullPath = InstanceSerializer.Serialize
+CodeGen.GetFullPath = function(Target: Instance)
+	local Resolver = wax.shared.SimpleSpyGetFullPath
+	if type(Resolver) == "function" then
+		local Success, Path = pcall(Resolver, Target)
+		if Success and type(Path) == "string" then
+			return Path
+		end
+	end
+
+	return InstanceSerializer.Serialize(Target)
+end
 
 
 -- SimpleSpy-compatible outgoing call serializer.
@@ -4367,6 +4377,18 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 				GetNilRequired = true
 			end
 			return Snapshot.Code
+		end
+
+		local Resolver = wax.shared.SimpleSpyGetFullPath
+		if type(Resolver) == "function" then
+			local Success, Path, Prelude = pcall(Resolver, Target)
+			if Success and type(Path) == "string" then
+				AddPrelude(Prelude)
+				if Prelude then
+					GetNilRequired = true
+				end
+				return Path
+			end
 		end
 
 		local Success, Path, Prelude = pcall(InstanceSerializer.Serialize, Target, {
@@ -10310,7 +10332,13 @@ local function ReadChildren(Parent: Instance): { Instance }?
 end
 
 local function IsSameObject(First: Instance, Second: Instance): boolean
-	return rawequal(First, Second) or First == Second
+	if rawequal(First, Second) or First == Second then
+		return true
+	end
+
+	local FirstDebugId = ReadDebugId(First)
+	local SecondDebugId = ReadDebugId(Second)
+	return FirstDebugId ~= nil and FirstDebugId == SecondDebugId
 end
 
 local function IsLocalPlayerObject(Object: Instance): boolean
@@ -10376,62 +10404,163 @@ local function BuildChildAccessor(Current: Instance, Parent: Instance, Name: str
 	return Fallback
 end
 
-local function BuildInstanceSnapshot(Target: Instance, VariableName: string?)
-	if typeof(Target) ~= "Instance" then
-		return nil
+local function IsValidLuaIdentifier(Name: string): boolean
+	return string.match(Name, "^[%a_][%w_]*$") ~= nil
+end
+
+local function FormatSimpleSpyName(Name: string): string
+	if IsValidLuaIdentifier(Name) then
+		return "." .. Name
 	end
 
-	local LookupMode = wax.shared.SaveManager.GetState(wax.shared.SaveManager, "InstancePathLookupChain")
-	local Parts = {}
-	local Current = Target
-	local Base = nil
-	local Prelude = nil
+	return "[" .. Quote(Name) .. "]"
+end
 
+local function GetSimpleSpyInstanceReference(Current: Instance): string
+	local Name = Current.Name
+	local Parent = Current.Parent
+	if not Parent then
+		return FormatSimpleSpyName(Name)
+	end
+
+	local Children = ReadChildren(Parent)
+	if not Children then
+		return FormatSimpleSpyName(Name)
+	end
+
+	local SameNameCount = 0
+	local AbsoluteIndex = nil
+	for Index, Child in Children do
+		if Child.Name == Name then
+			SameNameCount += 1
+		end
+
+		if IsSameObject(Child, Current) then
+			AbsoluteIndex = Index
+		end
+	end
+
+	if SameNameCount > 1 and AbsoluteIndex then
+		return ":GetChildren()[" .. tostring(AbsoluteIndex) .. "]"
+	end
+
+	return FormatSimpleSpyName(Name)
+end
+
+local function FindSimpleSpyCharacterAncestor(Target: Instance): Instance?
+	local Current = Target
 	for _ = 1, 256 do
 		if typeof(Current) ~= "Instance" then
 			break
 		end
 
-		local Name = Current.Name
-		local ClassName = Current.ClassName
-		local Parent = Current.Parent
+		if Current.ClassName == "Model" then
+			local Success, Humanoid = pcall(function()
+				local FindFirstChildOfClass = Current.FindFirstChildOfClass
+				return FindFirstChildOfClass(Current, "Humanoid")
+			end)
 
-		if ClassName == "DataModel" then
-			Base = "game"
+			if Success and Humanoid then
+				return Current
+			end
+		end
+
+		Current = Current.Parent
+	end
+
+	return nil
+end
+
+-- Mirrors the uploaded SimpleSpy getFullPath logic:
+--   * humanoid-model ancestry -> LocalPlayer.Character
+--   * service roots -> game:GetService(...)
+--   * invalid identifiers -> ["name"]
+--   * duplicate siblings -> :GetChildren()[absoluteIndex]
+-- Cobalt's GetNil(DebugId) reference is retained for nil-parent roots because a
+-- literal "game.Name" path cannot retrieve a nil-parent Instance.
+local function SimpleSpyGetFullPath(Target: Instance): (string?, string?)
+	if typeof(Target) ~= "Instance" then
+		return nil, nil
+	end
+
+	local Character = FindSimpleSpyCharacterAncestor(Target)
+	if Character then
+		local CharacterParts = {}
+		local Current = Target
+
+		for _ = 1, 256 do
+			if typeof(Current) ~= "Instance" or IsSameObject(Current, Character) or Current == game then
+				break
+			end
+
+			table.insert(CharacterParts, 1, FormatSimpleSpyName(Current.Name))
+			Current = Current.Parent
+		end
+
+		return 'game:GetService("Players").LocalPlayer.Character' .. table.concat(CharacterParts), nil
+	end
+
+	local PathParts = {}
+	local Current = Target
+	local Base = nil
+	local Prelude = nil
+
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" or Current == game then
 			break
-		elseif IsLocalCharacterObject(Current) then
-			Base = 'game:GetService("Players").LocalPlayer.Character'
+		end
+
+		local Parent = Current.Parent
+		local CurrentReference = GetSimpleSpyInstanceReference(Current)
+		if CurrentReference then
+			table.insert(PathParts, 1, CurrentReference)
+		end
+
+		local Success, Service = pcall(function()
+			local GetService = game.GetService
+			return GetService(game, Current.ClassName)
+		end)
+
+		if Success and typeof(Service) == "Instance" and IsSameObject(Service, Current) then
+			Base = 'game:GetService(' .. Quote(Current.ClassName) .. ')'
+			if #PathParts > 0 then
+				table.remove(PathParts, 1)
+			end
 			break
-		elseif IsLocalPlayerObject(Current) then
-			Base = 'game:GetService("Players").LocalPlayer'
-			break
-		elseif Parent == nil then
+		end
+
+		if Parent == nil then
 			local DebugId = ReadDebugId(Current)
 			if DebugId then
-				Base = "GetNil(" .. Quote(Name) .. ", " .. Quote(DebugId) .. ")"
+				Base = "GetNil(" .. Quote(Current.Name) .. ", " .. Quote(DebugId) .. ")"
 				Prelude = GetNilCode
+				if #PathParts > 0 then
+					table.remove(PathParts, 1)
+				end
 			else
-				Base = "nil --[[Nil parent: " .. string.gsub(tostring(Name), "%]%]", "] ]") .. "]]"
+				Base = "nil --[[Nil parent: " .. string.gsub(tostring(Current.Name), "%]%]", "] ]") .. "]]"
 			end
 			break
-		elseif Parent.ClassName == "DataModel" then
-			if ClassName == "Workspace" then
-				Base = "workspace"
-			else
-				Base = "game:GetService(" .. Quote(ClassName) .. ")"
-			end
-			break
-		else
-			table.insert(Parts, 1, BuildChildAccessor(Current, Parent, Name, LookupMode))
-			Current = Parent
 		end
+
+		Current = Parent
 	end
 
 	if not Base then
+		Base = "game"
+	end
+
+	return (Base .. table.concat(PathParts)):gsub("%.%[", "["), Prelude
+end
+
+wax.shared.SimpleSpyGetFullPath = SimpleSpyGetFullPath
+
+local function BuildInstanceSnapshot(Target: Instance, VariableName: string?)
+	local Code, Prelude = SimpleSpyGetFullPath(Target)
+	if type(Code) ~= "string" then
 		return nil
 	end
 
-	local Code = Base .. table.concat(Parts)
 	if VariableName then
 		Code = "local " .. VariableName .. " = " .. Code
 	end
@@ -10464,16 +10593,17 @@ end
 local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
 	local Cache = wax.shared.CallPathSnapshots
 	local CacheKey = CallInfo.Arguments or CallInfo
-	local Snapshots = Cache[CacheKey]
 
-	if not Snapshots then
-		Snapshots = {
-			Event = BuildInstanceSnapshot(RemoteInstance, "Event"),
-			Instances = {},
-		}
-		Cache[CacheKey] = Snapshots
-	end
+	-- Always create a fresh snapshot. The same call can be observed once inside
+	-- the hook and again after the caller resumes; reusing the first table would
+	-- preserve an obsolete Character/Workspace path instead of the nil-parent
+	-- state displayed by Cobalt.
+	local Snapshots = {
+		Event = BuildInstanceSnapshot(RemoteInstance, "Event"),
+		Instances = {},
+	}
 
+	Cache[CacheKey] = Snapshots
 	Cache[CallInfo] = Snapshots
 	if CallInfo.InvokeResult then
 		Cache[CallInfo.InvokeResult] = Snapshots
@@ -11004,10 +11134,11 @@ function Log:Call(RawInfo): number?
 	local Info = DeepClone(RawInfo)
 	Info.CreationTime = tick()
 
-	-- Never allow code-generation metadata to affect the intercepted call.
-	-- This runs synchronously to preserve the original ancestry, but all engine
-	-- methods inside the snapshotter use direct function calls instead of ':'.
-	pcall(CaptureCallPaths, Info, self.Instance)
+	-- Path generation is intentionally deferred until after the intercepted
+	-- caller resumes. Tool-drop scripts commonly call FireServer while the Tool
+	-- is still parented, then set Parent = nil immediately after the call. This
+	-- matches SimpleSpy's scheduled logging behavior and avoids executing any
+	-- Instance traversal inside the active remote hook.
 
 	--// Actor Relaying \\--
 	if wax.shared.IS_ACTOR then
@@ -11083,7 +11214,37 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	QueueNotification(self, Index)
+	-- SimpleSpy does not generate code from inside the active hook. It queues the
+	-- call and processes one item from RunService.Heartbeat. Waiting for the next
+	-- Heartbeat is significant for Tool drops: the caller can set Tool.Parent =
+	-- nil immediately after FireServer returns, and the stored replay code must
+	-- capture that nil-parent state before Cobalt exposes the log to the UI.
+	local SnapshotInfo = Info
+	local SnapshotRemote = self.Instance
+	local SnapshotLog = self
+	local SnapshotIndex = Index
+
+	local function CaptureAndPublish()
+		if SnapshotLog.Calls[SnapshotIndex] ~= SnapshotInfo then
+			return
+		end
+
+		pcall(CaptureCallPaths, SnapshotInfo, SnapshotRemote)
+		QueueNotification(SnapshotLog, SnapshotIndex)
+	end
+
+	local RunService = wax.shared.RunService
+	if RunService and RunService.Heartbeat then
+		task.spawn(function()
+			pcall(function()
+				RunService.Heartbeat:Wait()
+			end)
+			CaptureAndPublish()
+		end)
+	else
+		task.defer(CaptureAndPublish)
+	end
+
 	return Index
 end
 
