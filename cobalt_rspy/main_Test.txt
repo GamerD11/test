@@ -4370,15 +4370,9 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	end
 
 	local function GetInstancePath(Target)
-		local Snapshot = GetSnapshotForInstance(Target)
-		if Snapshot and type(Snapshot.Code) == "string" then
-			AddPrelude(Snapshot.Prelude)
-			if Snapshot.Prelude then
-				GetNilRequired = true
-			end
-			return Snapshot.Code
-		end
-
+		-- Resolve through SimpleSpy's live getFullPath logic first. This keeps
+		-- copied calling code synchronized with the argument UI when a Tool or
+		-- one of its descendants is reparented after the remote was logged.
 		local Resolver = wax.shared.SimpleSpyGetFullPath
 		if type(Resolver) == "function" then
 			local Success, Path, Prelude = pcall(Resolver, Target)
@@ -4389,6 +4383,18 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 				end
 				return Path
 			end
+		end
+
+		-- Use the historical path only if the live Instance can no longer be
+		-- resolved. This prevents a stale GetNil(...) preview from disagreeing
+		-- with a valid LocalPlayer.Character/Workspace path in copied code.
+		local Snapshot = GetSnapshotForInstance(Target)
+		if Snapshot and type(Snapshot.Code) == "string" then
+			AddPrelude(Snapshot.Prelude)
+			if Snapshot.Prelude then
+				GetNilRequired = true
+			end
+			return Snapshot.Code
 		end
 
 		local Success, Path, Prelude = pcall(InstanceSerializer.Serialize, Target, {
@@ -19181,15 +19187,9 @@ return function(props: {
 		ArgumentList.Clear(OriginalArgsInfoFrame)
 
 		--// Populate Arguments \\--
-		local SnapshotCache = wax.shared.CallPathSnapshots
-		local PathSnapshots = SnapshotCache and (
-			SnapshotCache[CallInfo]
-			or (CallInfo.Arguments and SnapshotCache[CallInfo.Arguments])
-			or (CallInfo.InvokeResult and SnapshotCache[CallInfo.InvokeResult])
-		)
-		local ArgumentOptions = {
-			PathSnapshots = PathSnapshots,
-		}
+		-- Argument rows use the same live SimpleSpy getFullPath resolution as
+		-- Copy Calling Code. Stale call-time snapshots are not forced into the UI.
+		local ArgumentOptions = {}
 
 		ArgumentList.Populate(ArgumentsInfoFrame, CallInfo[InitialDataView], ArgumentOptions)
 
@@ -22755,17 +22755,19 @@ function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 	elseif typeof(Argument) == "table" then
 		return "{...}"
 	elseif typeof(Argument) == "Instance" then
-		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
-		if SnapshotPath then
-			return SnapshotPath
-		end
-
+		-- Match Copy Calling Code: use the current SimpleSpy getFullPath result
+		-- before consulting the historical snapshot.
 		local Resolver = wax.shared.SimpleSpyGetFullPath
 		if type(Resolver) == "function" then
 			local Success, Path = pcall(Resolver, Argument)
 			if Success and type(Path) == "string" then
 				return Path
 			end
+		end
+
+		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
+		if SnapshotPath then
+			return SnapshotPath
 		end
 
 		return InstanceSerializer.Serialize(Argument, { DisableNilParentHandler = true })
