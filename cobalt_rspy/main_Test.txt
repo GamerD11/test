@@ -4312,7 +4312,7 @@ local function GetSimpleSpyCompatConfig()
 	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
 	if type(Config.MaxTableSize) ~= "number" then Config.MaxTableSize = 1000 end
 	if type(Config.MaxStringSize) ~= "number" then Config.MaxStringSize = 10000 end
-	if Config.PreserveNilArguments == nil then Config.PreserveNilArguments = true end
+	if Config.PreserveNilArguments == nil then Config.PreserveNilArguments = false end
 
 	return Config
 end
@@ -4809,17 +4809,7 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	if ArgumentCount > 0 then
 		Generated = ValueToVariable("args", ArgumentsForSerialization) .. "\n"
 
-		if Config.PreserveNilArguments then
-			Generated = Generated
-				.. RemotePath
-				.. ":"
-				.. Method
-				.. "(unpack(args, 1, "
-				.. tostring(ArgumentCount)
-				.. "))"
-		else
-			Generated = Generated .. RemotePath .. ":" .. Method .. "(unpack(args))"
-		end
+		Generated = Generated .. RemotePath .. ":" .. Method .. "(unpack(args))"
 	else
 		Generated = RemotePath .. ":" .. Method .. "()"
 	end
@@ -10289,7 +10279,22 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
-local GetNilCode = require("@src/Utils/CodeGen/Templates/Referencing").GetNilCode
+local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
+	for _, Object in getnilinstances() do
+		if Object.Name ~= Name or Object.ClassName ~= ClassName then
+			continue
+		end
+
+		if DebugId == nil then
+			return Object
+		end
+
+		local Success, ObjectDebugId = pcall(Object.GetDebugId, Object)
+		if Success and ObjectDebugId == DebugId then
+			return Object
+		end
+	end
+end]]
 
 -- Call-time paths must be captured without invoking Instance methods through
 -- ':' syntax. A nested engine namecall inside the active __namecall hook can
@@ -10531,14 +10536,21 @@ local function SimpleSpyGetFullPath(Target: Instance): (string?, string?)
 
 		if Parent == nil then
 			local DebugId = ReadDebugId(Current)
-			if DebugId then
-				Base = "GetNil(" .. Quote(Current.Name) .. ", " .. Quote(DebugId) .. ")"
-				Prelude = GetNilCode
-				if #PathParts > 0 then
-					table.remove(PathParts, 1)
-				end
-			else
-				Base = "nil --[[Nil parent: " .. string.gsub(tostring(Current.Name), "%]%]", "] ]") .. "]]"
+			local DebugIdExpression = DebugId and Quote(DebugId) or "nil"
+
+			Base = "GetNil("
+				.. Quote(Current.Name)
+				.. ", "
+				.. Quote(Current.ClassName)
+				.. ", "
+				.. DebugIdExpression
+				.. ")"
+			Prelude = GetNilCode
+
+			-- PathParts already contains the nil-parent root itself. Remove that
+			-- accessor because GetNil(...) resolves the root object directly.
+			if #PathParts > 0 then
+				table.remove(PathParts, 1)
 			end
 			break
 		end
@@ -19169,7 +19181,17 @@ return function(props: {
 		ArgumentList.Clear(OriginalArgsInfoFrame)
 
 		--// Populate Arguments \\--
-		ArgumentList.Populate(ArgumentsInfoFrame, CallInfo[InitialDataView])
+		local SnapshotCache = wax.shared.CallPathSnapshots
+		local PathSnapshots = SnapshotCache and (
+			SnapshotCache[CallInfo]
+			or (CallInfo.Arguments and SnapshotCache[CallInfo.Arguments])
+			or (CallInfo.InvokeResult and SnapshotCache[CallInfo.InvokeResult])
+		)
+		local ArgumentOptions = {
+			PathSnapshots = PathSnapshots,
+		}
+
+		ArgumentList.Populate(ArgumentsInfoFrame, CallInfo[InitialDataView], ArgumentOptions)
 
 		local ShouldShowOriginalArgs = (
 			InitialDataView == "InvokeResult" and wax.shared.GetTableLength(CallInfo.Arguments) > 0
@@ -19177,7 +19199,7 @@ return function(props: {
 
 		Modal.Tabs:SetMounted("Args", ShouldShowOriginalArgs)
 		if ShouldShowOriginalArgs then
-			ArgumentList.Populate(OriginalArgsInfoFrame, CallInfo.Arguments)
+			ArgumentList.Populate(OriginalArgsInfoFrame, CallInfo.Arguments, ArgumentOptions)
 		end
 
 		--// Plugin Hooks \\--
@@ -19219,6 +19241,7 @@ type HolderOptions = {
 	Label: string?,
 	MaxPreviewLength: number?,
 	PreviewCache: { [number]: string }?,
+	PathSnapshots: any?,
 }
 
 local function TruncatePreviewText(Text: string, MaxLength: number): string
@@ -19230,14 +19253,14 @@ local function TruncatePreviewText(Text: string, MaxLength: number): string
 	return NormalizedText:sub(1, MaxLength) .. "..."
 end
 
-function ArgumentList.CreatePreviewText(Value: any, MaxLength: number?): string
+function ArgumentList.CreatePreviewText(Value: any, MaxLength: number?, PathSnapshots): string
 	MaxLength = MaxLength or DefaultPreviewMaxLength
 
 	if typeof(Value) == "string" then
 		return `"{TruncatePreviewText(Value, MaxLength)}"`
 	end
 
-	return TruncatePreviewText(tostring(LazySerializer.QuickSerializeArgument(Value)), MaxLength)
+	return TruncatePreviewText(tostring(LazySerializer.QuickSerializeArgument(Value, PathSnapshots)), MaxLength)
 end
 
 function ArgumentList.Clear(Frame: GuiObject)
@@ -19311,15 +19334,15 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	if IsPreview then
 		if PreviewCache then
 			if not PreviewCache[Index] then
-				PreviewCache[Index] = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength)
+				PreviewCache[Index] = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
 			end
 
 			Text = PreviewCache[Index]
 		else
-			Text = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength)
+			Text = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
 		end
 	else
-		Text = tostring(LazySerializer.QuickSerializeArgument(Value)):gsub("<", "&lt;"):gsub(">", "&gt;")
+		Text = tostring(LazySerializer.QuickSerializeArgument(Value, Options.PathSnapshots)):gsub("<", "&lt;"):gsub(">", "&gt;")
 	end
 
 	local TextLabel = Interface.New("TextLabel", {
@@ -19346,7 +19369,7 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	return Holder
 end
 
-function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?)
+function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?, Options: HolderOptions?)
 	if not Values then
 		return
 	end
@@ -19356,7 +19379,7 @@ function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?)
 			task.wait()
 		end
 
-		ArgumentList.CreateHolder(Index, Values[Index], Frame)
+		ArgumentList.CreateHolder(Index, Values[Index], Frame, Options)
 	end
 end
 
@@ -22684,7 +22707,28 @@ function LazySerializer.QuickSerializeNumber(Number: number)
 	return Number
 end
 
-function LazySerializer.QuickSerializeArgument(Argument)
+local function ResolveSnapshotPath(Argument: Instance, PathSnapshots)
+	local InstanceSnapshots = PathSnapshots and PathSnapshots.Instances
+	if not InstanceSnapshots then
+		return nil
+	end
+
+	local Direct = InstanceSnapshots[Argument]
+	if Direct and type(Direct.Code) == "string" then
+		return Direct.Code
+	end
+
+	for Reference, Snapshot in next, InstanceSnapshots do
+		local Success, Matches = pcall(InstanceSerializer.IsEqualToInstance, Reference, Argument)
+		if Success and Matches and type(Snapshot.Code) == "string" then
+			return Snapshot.Code
+		end
+	end
+
+	return nil
+end
+
+function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 	if typeof(Argument) == "string" then
 		return string.format('"%s"', (Argument :: string))
 	elseif typeof(Argument) == "number" then
@@ -22711,6 +22755,19 @@ function LazySerializer.QuickSerializeArgument(Argument)
 	elseif typeof(Argument) == "table" then
 		return "{...}"
 	elseif typeof(Argument) == "Instance" then
+		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
+		if SnapshotPath then
+			return SnapshotPath
+		end
+
+		local Resolver = wax.shared.SimpleSpyGetFullPath
+		if type(Resolver) == "function" then
+			local Success, Path = pcall(Resolver, Argument)
+			if Success and type(Path) == "string" then
+				return Path
+			end
+		end
+
 		return InstanceSerializer.Serialize(Argument, { DisableNilParentHandler = true })
 	elseif typeof(Argument) == "userdata" then
 		return "newproxy(" .. (getmetatable(Argument) and "true" or "false") .. ")"
