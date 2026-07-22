@@ -14761,7 +14761,8 @@ local MainFrame = Interface.New("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	BackgroundColor3 = Color3.fromRGB(15, 15, 15),
 	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(640, 420),
+	-- Start large and scale with the current viewport while keeping Cobalt resizable.
+	Size = UDim2.fromScale(0.82, 0.78),
 	ZIndex = 0,
 
 	Constants.MainUICorner,
@@ -23700,6 +23701,7 @@ return function(props: {
 		CurrentCallFrameRenderGeneration = 0,
 		NewestRefreshQueued = false,
 		PendingNewestRefreshLog = nil,
+		SelectedCallFrame = nil,
 	}
 
 	--// UI \\--
@@ -23718,9 +23720,11 @@ return function(props: {
 		},
 	})
 
+	local ActionPanelHeight = 112
+
 	local LogsList = Interface.New("ScrollingFrame", {
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 1, -38),
+		Size = UDim2.new(1, 0, 1, -(38 + ActionPanelHeight)),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		CanvasSize = UDim2.new(0, 0, 0, 0),
 		ScrollBarThickness = 2,
@@ -23735,6 +23739,31 @@ return function(props: {
 		["UIPadding"] = {
 			PaddingLeft = UDim.new(0, 2),
 			PaddingRight = UDim.new(0, 6),
+			PaddingTop = UDim.new(0, 2),
+			PaddingBottom = UDim.new(0, 2),
+		},
+	})
+
+	local LogsActions = Interface.New("Frame", {
+		AnchorPoint = Vector2.yAxis,
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 0, 1, -38),
+		Size = UDim2.new(1, 0, 0, ActionPanelHeight),
+		Parent = LogsWrapper,
+
+		["UIGridLayout"] = {
+			CellPadding = UDim2.fromOffset(5, 4),
+			CellSize = UDim2.new(1 / 3, -4, 0, 24),
+			FillDirection = Enum.FillDirection.Horizontal,
+			FillDirectionMaxCells = 3,
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+		},
+
+		["UIPadding"] = {
+			PaddingLeft = UDim.new(0, 2),
+			PaddingRight = UDim.new(0, 2),
 			PaddingTop = UDim.new(0, 2),
 			PaddingBottom = UDim.new(0, 2),
 		},
@@ -23757,6 +23786,7 @@ return function(props: {
 
 	Calls.Wrapper = LogsWrapper
 	Calls.List = LogsList
+	Calls.Actions = LogsActions
 	Calls.Pagination = LogsPagination
 
 	--// Helpers \\--
@@ -23836,6 +23866,205 @@ return function(props: {
 			warn(ErrorMessage, Error)
 		end
 	end
+
+	local function GetCompatConfig()
+		local Environment = getgenv()
+		local Config = Environment.CobaltSimpleSpyConfig
+		if type(Config) ~= "table" then
+			Config = {}
+			Environment.CobaltSimpleSpyConfig = Config
+		end
+
+		if type(Config.Blacklist) ~= "table" then
+			Config.Blacklist = {}
+		end
+		if type(Config.Blocklist) ~= "table" then
+			Config.Blocklist = {}
+		end
+
+		return Config
+	end
+
+	local function GetRemoteDebugId(Remote: Instance): string?
+		if typeof(Remote) ~= "Instance" then
+			return nil
+		end
+
+		local Success, Result = pcall(Remote.GetDebugId, Remote)
+		return Success and type(Result) == "string" and Result or nil
+	end
+
+	local function RequireSelectedCall()
+		local CallInfo = Calls.ActiveCallInfo
+		if CallInfo then
+			return CallInfo
+		end
+
+		-- Match SimpleSpy's single-selection workflow: when no packet card was
+		-- explicitly selected, operate on the newest packet of the current remote.
+		local CurrentLog = LogsPage.GetCurrentLog()
+		if CurrentLog then
+			local RawCall = GetCallByVisibleIndex(CurrentLog, 1)
+			if RawCall then
+				CallInfo = setmetatable({
+					Instance = CurrentLog.Instance,
+					Type = CurrentLog.Type,
+					Order = 1,
+					PreviewCache = GetPreviewCache(RawCall),
+				}, {
+					__index = RawCall,
+				})
+				Calls.ActiveCallInfo = CallInfo
+				return CallInfo
+			end
+		end
+
+		wax.shared.Sonner.error("Select a remote or packet first")
+		return nil
+	end
+
+	local function SetExactFilter(FilterTable, Remote: Instance)
+		FilterTable[Remote] = true
+		local DebugId = GetRemoteDebugId(Remote)
+		if DebugId then
+			FilterTable[DebugId] = true
+		end
+	end
+
+	local function CreateRSpyButton(Text: string, Order: number, Callback: () -> ())
+		local Button = Interface.New("TextButton", {
+			AutoButtonColor = true,
+			BackgroundColor3 = Color3.fromRGB(25, 25, 25),
+			LayoutOrder = Order,
+			Size = UDim2.fromScale(1, 1),
+			Text = Text,
+			TextColor3 = Color3.new(1, 1, 1),
+			TextSize = 13,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = LogsActions,
+
+			["UICorner"] = {
+				CornerRadius = UDim.new(0, 4),
+			},
+
+			["UIStroke"] = {
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+				Color = Color3.fromRGB(55, 55, 55),
+				Transparency = 0.35,
+			},
+		})
+
+		Button.MouseButton1Click:Connect(function()
+			local Success, Error = pcall(Callback)
+			if not Success then
+				wax.shared.Sonner.error("Action failed")
+				warn(`Cobalt RSpy action {Text} failed: {Error}`)
+			end
+		end)
+
+		return Button
+	end
+
+	CreateRSpyButton("Copy Code", 1, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		CopyToClipboard(CodeGen:BuildCallCode(CallInfo), "Copied code to clipboard", "Failed to copy code")
+	end)
+
+	CreateRSpyButton("Copy Remote", 2, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		CopyToClipboard(
+			InstanceSerializer.Serialize(CallInfo.Instance, { DisableNilParentHandler = false }),
+			"Copied remote path",
+			"Failed to copy remote path"
+		)
+	end)
+
+	CreateRSpyButton("Run Code", 3, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		wax.shared.Sonner.promise(function()
+			CodeGen:ReplayCallInfo(CallInfo)
+		end, {
+			loadingText = "Running call...",
+			successText = "Call executed",
+			errorText = "Call failed",
+			time = 4.5,
+		})
+	end)
+
+	CreateRSpyButton("Get Script", 4, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		if typeof(CallInfo.Origin) ~= "Instance" then
+			wax.shared.Sonner.error("Calling script is unavailable")
+			return
+		end
+		CopyToClipboard(
+			InstanceSerializer.Serialize(CallInfo.Origin, { DisableNilParentHandler = false }),
+			"Copied calling script path",
+			"Failed to copy script path"
+		)
+	end)
+
+	CreateRSpyButton("Function Info", 5, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		if Window.Modals.Info then
+			Window.Modals.Info:Open(CallInfo)
+		end
+	end)
+
+	CreateRSpyButton("Clr Logs", 6, function()
+		LogsPage.ClearLogs()
+		Calls.ActiveCallInfo = nil
+		Calls.SelectedCallFrame = nil
+	end)
+
+	CreateRSpyButton("Exclude (i)", 7, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		local Config = GetCompatConfig()
+		SetExactFilter(Config.Blacklist, CallInfo.Instance)
+		wax.shared.Sonner.success("Remote instance excluded")
+	end)
+
+	CreateRSpyButton("Exclude (n)", 8, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		local Config = GetCompatConfig()
+		Config.Blacklist[CallInfo.Instance.Name] = true
+		wax.shared.Sonner.success("Remote name excluded")
+	end)
+
+	CreateRSpyButton("Clr Blacklist", 9, function()
+		local Config = GetCompatConfig()
+		table.clear(Config.Blacklist)
+		wax.shared.Sonner.success("Blacklist cleared")
+	end)
+
+	CreateRSpyButton("Block (i)", 10, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		local Config = GetCompatConfig()
+		SetExactFilter(Config.Blocklist, CallInfo.Instance)
+		wax.shared.Sonner.success("Remote instance blocked")
+	end)
+
+	CreateRSpyButton("Block (n)", 11, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		local Config = GetCompatConfig()
+		Config.Blocklist[CallInfo.Instance.Name] = true
+		wax.shared.Sonner.success("Remote name blocked")
+	end)
+
+	CreateRSpyButton("Clr Blocklist", 12, function()
+		local Config = GetCompatConfig()
+		table.clear(Config.Blocklist)
+		wax.shared.Sonner.success("Blocklist cleared")
+	end)
 
 	local function GetInitialFilterCondition(CallInfo): Types.QueryBuilderCondition
 		local Value = CallInfo.Arguments and CallInfo.Arguments[1]
@@ -24017,6 +24246,9 @@ return function(props: {
 	end
 
 	function Calls:ReleaseCallFrame(CallFrame)
+		if self.SelectedCallFrame == CallFrame then
+			self.SelectedCallFrame = nil
+		end
 		CallFrame.Parent = nil
 		table.insert(self.CallFramePool, CallFrame)
 	end
@@ -24080,16 +24312,35 @@ return function(props: {
 
 			wax.shared.TweenService
 				:Create(Data.HighlightStroke, Constants.DefaultTweenInfo, {
-					Transparency = if Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
+					Transparency = if Data.IsSelected then 0 elseif Data.IsBlockedCall then 0.5 elseif Data.IsHighlightedCall then 0.35 else 1,
 				})
 				:Play()
 		end)
 
 		CallFrame.MouseButton1Click:Connect(function()
 			local Data = self.CallFrameData[CallFrame]
-			if Data and Data.CallInfo and Window.Modals.Info then
-				Window.Modals.Info:Open(Data.CallInfo)
+			if not (Data and Data.CallInfo) then
+				return
 			end
+
+			local PreviousFrame = self.SelectedCallFrame
+			if PreviousFrame and PreviousFrame ~= CallFrame then
+				local PreviousData = self.CallFrameData[PreviousFrame]
+				if PreviousData then
+					PreviousData.IsSelected = false
+					PreviousData.HighlightStroke.Transparency = if PreviousData.IsBlockedCall
+						then 0.5
+						elseif PreviousData.IsHighlightedCall then 0.35
+						else 1
+				end
+			end
+
+			self.ActiveCallInfo = Data.CallInfo
+			self.SelectedCallFrame = CallFrame
+			Data.IsSelected = true
+			Data.HighlightStroke.Color = Color3.fromRGB(92, 126, 229)
+			Data.HighlightStroke.Transparency = 0
+			wax.shared.Sonner.success("Packet selected")
 		end)
 
 		local function PrepareCallContext(): boolean
@@ -24133,6 +24384,7 @@ return function(props: {
 		Data.CallInfo = CallInfo
 		Data.IsBlockedCall = IsBlockedCall
 		Data.IsHighlightedCall = IsHighlightedCall
+		Data.IsSelected = false
 
 		CallFrame.BackgroundColor3 = if IsBlockedCall then Color3.fromRGB(34, 18, 18) else Color3.fromRGB(25, 25, 25)
 		CallFrame.LayoutOrder = CallInfo.Order
