@@ -10286,7 +10286,7 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
--- Cobalt SimpleSpy compatibility v8: bounded low-lag parent/path resolution.
+-- Cobalt SimpleSpy compatibility v9: universal exact parent tracking.
 
 local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
 	for _, Object in getnilinstances() do
@@ -10663,191 +10663,50 @@ local function SquaredDistance(First: Vector3, Second: Vector3): number
 	return X * X + Y * Y + Z * Z
 end
 
-local ResolutionCandidateCache = {}
-local ResolutionCacheLifetime = 0.25
-local ResolutionCandidateLimit = 64
-
-local function AddUniqueResolutionRoot(Roots, Seen, Root)
-	if typeof(Root) ~= "Instance" or Seen[Root] then
-		return
-	end
-
-	Seen[Root] = true
-	table.insert(Roots, Root)
-end
-
-local function GetResolutionRoots()
-	local Roots = {}
-	local Seen = setmetatable({}, { __mode = "k" })
-	local LocalPlayer = wax.shared.LocalPlayer
-
-	if LocalPlayer then
-		AddUniqueResolutionRoot(Roots, Seen, LocalPlayer.Character)
-		AddUniqueResolutionRoot(Roots, Seen, GetLocalBackpack())
-	end
-
-	-- Dropped tools in this game replicate under Workspace.Filter.SpawnedTools.
-	-- Restricting replacement searches to this container prevents both global
-	-- DataModel scans and accidental matches in another player's Backpack.
-	local Workspace
-	pcall(function()
-		local GetService = game.GetService
-		Workspace = GetService(game, "Workspace")
-	end)
-
-	if Workspace then
-		local Filter
-		local SpawnedTools
-		pcall(function()
-			local FindFirstChild = Workspace.FindFirstChild
-			Filter = FindFirstChild(Workspace, "Filter")
-			if Filter then
-				local FilterFindFirstChild = Filter.FindFirstChild
-				SpawnedTools = FilterFindFirstChild(Filter, "SpawnedTools")
-			end
-		end)
-		AddUniqueResolutionRoot(Roots, Seen, SpawnedTools)
-	end
-
-	return Roots
-end
-
-local function CollectBoundedCandidates(Name: string, ClassName: string): { Instance }
-	local CacheKey = ClassName .. "|" .. Name
-	local Now = os.clock()
-	local Cached = ResolutionCandidateCache[CacheKey]
-	if Cached and Now - Cached.Time <= ResolutionCacheLifetime then
-		return Cached.Values
-	end
-
-	local Candidates = {}
-	for _, Root in GetResolutionRoots() do
-		local RootName, RootClass = ReadMetadata(Root)
-		if RootName == Name and RootClass == ClassName then
-			table.insert(Candidates, Root)
-		end
-
-		if #Candidates >= ResolutionCandidateLimit then
-			break
-		end
-
-		local Success, Descendants = pcall(function()
-			local GetDescendants = Root.GetDescendants
-			return GetDescendants(Root)
-		end)
-		if not Success or type(Descendants) ~= "table" then
-			continue
-		end
-
-		for _, Candidate in Descendants do
-			local CandidateName, CandidateClass = ReadMetadata(Candidate)
-			if CandidateName == Name and CandidateClass == ClassName then
-				table.insert(Candidates, Candidate)
-				if #Candidates >= ResolutionCandidateLimit then
-					break
-				end
-			end
-		end
-
-		if #Candidates >= ResolutionCandidateLimit then
-			break
-		end
-	end
-
-	ResolutionCandidateCache[CacheKey] = {
-		Time = Now,
-		Values = Candidates,
-	}
-	return Candidates
-end
-
+-- Universal exact-reference resolver.
+--
+-- Do not search game-specific containers and do not guess by Name/ClassName.
+-- A same-named Tool or Handle can belong to another player, so heuristic
+-- replacement can silently generate a valid path to the wrong Instance.
+--
+-- Cobalt keeps both the original hook argument and the cloned CallInfo value.
+-- During temporary reparenting, either reference may report Parent later. Only
+-- those exact references (or compareinstances-identical references) are used.
 local function ResolveLiveInstance(Target: Instance, Record): Instance
 	if typeof(Target) ~= "Instance" or Target == game then
 		return Target
 	end
 
-	-- Exact references are authoritative and cost O(1).
-	if Record and typeof(Record.Original) == "Instance" and ReadParent(Record.Original) ~= nil then
-		return Record.Original
-	end
-	if ReadParent(Target) ~= nil then
-		return Target
-	end
-	if Record and typeof(Record.Resolved) == "Instance" and ReadParent(Record.Resolved) ~= nil then
-		return Record.Resolved
-	end
-
-	local Name, ClassName = ReadMetadata(Target)
-	if Record then
-		Name = Record.Name or Name
-		ClassName = Record.ClassName or ClassName
-	end
-	if not Name or not ClassName then
-		return Target
-	end
-
-	local ExactMatches = {}
-	local StructuredMatches = {}
-	local PositionHint = Record and Record.PositionHint
-
-	for _, Candidate in CollectBoundedCandidates(Name, ClassName) do
-		if ReadParent(Candidate) == nil then
-			continue
+	local function UseIfParented(Candidate)
+		if typeof(Candidate) ~= "Instance" or ReadParent(Candidate) == nil then
+			return nil
 		end
 
-		local Exact = IsSameObject(Candidate, Target)
-		if not Exact and Record and typeof(Record.Original) == "Instance" then
-			Exact = IsSameObject(Candidate, Record.Original)
+		if Record then
+			Record.Resolved = Candidate
 		end
-		if not Exact and Record and Record.DebugId then
-			Exact = ReadDebugId(Candidate) == Record.DebugId
-		end
-		if Exact then
-			table.insert(ExactMatches, Candidate)
-			continue
-		end
-
-		-- Never guess a generic Handle without its Tool ancestry and explicit
-		-- position argument. This prevents cross-tool/cross-player remapping.
-		if
-			not Record
-			or not PositionHint
-			or not CandidateMatchesSuffix(Candidate, Record)
-			or (Record.ClassName ~= "Tool" and not Record.ToolName)
-		then
-			continue
-		end
-
-		local CandidatePosition = ReadObjectPosition(Candidate)
-		if CandidatePosition then
-			table.insert(StructuredMatches, {
-				Instance = Candidate,
-				Distance = SquaredDistance(PositionHint, CandidatePosition),
-			})
-		end
+		return Candidate
 	end
 
-	if #ExactMatches == 1 then
-		if Record then Record.Resolved = ExactMatches[1] end
-		return ExactMatches[1]
+	-- A previously resolved exact reference is cheapest and authoritative.
+	local Resolved = Record and UseIfParented(Record.Resolved)
+	if Resolved then
+		return Resolved
 	end
 
-	if #StructuredMatches > 0 then
-		table.sort(StructuredMatches, function(Left, Right)
-			return Left.Distance < Right.Distance
-		end)
-
-		local Best = StructuredMatches[1]
-		local Second = StructuredMatches[2]
-		if
-			Best.Distance <= 64 * 64
-			and (not Second or Second.Distance - Best.Distance >= 1)
-		then
-			if Record then Record.Resolved = Best.Instance end
-			return Best.Instance
-		end
+	-- The raw hook argument is preferred over Cobalt's cloned reference.
+	Resolved = Record and UseIfParented(Record.Original)
+	if Resolved then
+		return Resolved
 	end
 
+	Resolved = UseIfParented(Target)
+	if Resolved then
+		return Resolved
+	end
+
+	-- No global DataModel scan and no Name/Class fallback. Returning the exact
+	-- nil-parent reference is safer than producing a path to another object.
 	return Target
 end
 
@@ -11205,6 +11064,7 @@ local function GetSimpleSpyCompatConfig()
 	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
 	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
 	if type(Config.PathCaptureBudget) ~= "number" then Config.PathCaptureBudget = 64 end
+	if type(Config.PathResolveFrames) ~= "number" then Config.PathResolveFrames = 18 end
 
 	return Config
 end
@@ -11314,8 +11174,8 @@ local function QueueNotification(LogObject, CallIndex: number)
 end
 
 
--- One shared queue replaces one coroutine plus up to 60 full path scans per
--- remote call. Work is capped per Heartbeat so remote spam cannot freeze a frame.
+-- One shared queue retries only exact raw/cloned references. No game-specific
+-- folders, global descendant scans, or Name/Class replacement are used.
 local PathCaptureQueue = {
 	Items = {},
 	Head = 1,
@@ -11329,7 +11189,13 @@ local function QueuePathCapture(LogObject, CallIndex: number, CallInfo, RemoteIn
 		Index = CallIndex,
 		Info = CallInfo,
 		Remote = RemoteInstance,
+		Attempts = 0,
 	}
+end
+
+local function RequeuePathCapture(Item)
+	PathCaptureQueue.Tail += 1
+	PathCaptureQueue.Items[PathCaptureQueue.Tail] = Item
 end
 
 local function ProcessPathCaptureQueue()
@@ -11337,16 +11203,37 @@ local function ProcessPathCaptureQueue()
 	local Budget = tonumber(Config.PathCaptureBudget) or 64
 	Budget = math.clamp(math.floor(Budget), 1, 256)
 
+	-- Temporary Parent=nil transitions normally settle within a few frames.
+	-- The shared queue retries exact references only; it never scans the game.
+	local ResolveFrames = tonumber(Config.PathResolveFrames) or 18
+	ResolveFrames = math.clamp(math.floor(ResolveFrames), 0, 120)
+
 	local Processed = 0
-	while PathCaptureQueue.Head <= PathCaptureQueue.Tail and Processed < Budget do
+	local TailAtFrameStart = PathCaptureQueue.Tail
+	while PathCaptureQueue.Head <= TailAtFrameStart and Processed < Budget do
 		local Item = PathCaptureQueue.Items[PathCaptureQueue.Head]
 		PathCaptureQueue.Items[PathCaptureQueue.Head] = nil
 		PathCaptureQueue.Head += 1
 		Processed += 1
 
 		if Item and Item.Log.Calls[Item.Index] == Item.Info then
-			pcall(CaptureCallPaths, Item.Info, Item.Remote)
-			QueueNotification(Item.Log, Item.Index)
+			local OriginRecords = GetOriginRecords(Item.Info)
+			local Unresolved = false
+			local Success, Result = pcall(function()
+				return HasUnresolvedInstancePath(Item.Info.Arguments, {}, OriginRecords)
+					or HasUnresolvedInstancePath(Item.Info.InvokeResult, {}, OriginRecords)
+			end)
+			if Success then
+				Unresolved = Result == true
+			end
+
+			if Unresolved and Item.Attempts < ResolveFrames then
+				Item.Attempts += 1
+				RequeuePathCapture(Item)
+			else
+				pcall(CaptureCallPaths, Item.Info, Item.Remote)
+				QueueNotification(Item.Log, Item.Index)
+			end
 		end
 	end
 
