@@ -10206,7 +10206,7 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
--- Cobalt SimpleSpy compatibility v9: universal exact parent tracking.
+-- Cobalt SimpleSpy compatibility v11: universal call-card UI/path synchronization.
 
 local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
 	for _, Object in getnilinstances() do
@@ -24025,6 +24025,18 @@ return function(props: {
 		local CallInfoValueCount = wax.shared.GetTableLength(CallInfoValues)
 		local HasError = CallInfo.Error ~= nil
 
+		-- Use the exact same per-call SimpleSpy path state as Copy Calling Code.
+		-- The main call-card preview previously omitted PathSnapshots entirely, so
+		-- cloned Instance arguments stayed on GetNil(...) even after the retained
+		-- raw reference acquired its new parent. This lookup is universal and does
+		-- not scan or hardcode any game hierarchy.
+		local PathCache = wax.shared.CallPathSnapshots
+		local PathSnapshots = PathCache and (
+			PathCache[CallInfo]
+			or (CallInfo.Arguments and PathCache[CallInfo.Arguments])
+			or (CallInfo.InvokeResult and PathCache[CallInfo.InvokeResult])
+		)
+
 		local function ReleaseIfStale()
 			if RenderGeneration and RenderGeneration ~= self.CurrentCallFrameRenderGeneration then
 				self:ReleaseCallFrame(CallFrame)
@@ -24082,6 +24094,7 @@ return function(props: {
 					IsPreview = true,
 					MaxPreviewLength = MaxArgumentPreviewLength,
 					PreviewCache = CallInfo.PreviewCache,
+					PathSnapshots = PathSnapshots,
 				})
 			end
 		end
