@@ -4328,6 +4328,25 @@ local function GetCallPathSnapshots(CallInfo)
 		or (CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
 end
 
+-- Local helpers required by the SimpleSpy-compatible serializer.
+-- Earlier builds referenced these names without defining them in this Wax module,
+-- so outgoing code generation threw and silently fell back to Cobalt's native
+-- direct-argument renderer.
+local NumberConstants = {
+    ["inf"] = "math.huge",
+    ["-inf"] = "-math.huge",
+    ["nan"] = "0/0",
+}
+
+local function RawToString(Value)
+    local Success, Result = pcall(tostring, Value)
+    return Success and Result or "<tostring failed>"
+end
+
+local function FormatString(Value)
+    return '"' .. Formatter.FormatLuaString(tostring(Value)) .. '"'
+end
+
 local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	local Config = GetSimpleSpyCompatConfig()
 	local Snapshots = GetCallPathSnapshots(CallInfo)
@@ -4338,6 +4357,10 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	local GetNilRequired = false
 	local MaxTableSize = math.max(1, math.floor(Config.MaxTableSize))
 	local MaxStringSize = math.max(1, math.floor(Config.MaxStringSize))
+
+	local ValueToString
+	local TableToString
+	local ValueToPath
 
 	local function AddPrelude(Prelude)
 		if type(Prelude) ~= "string" or Prelude == "" or TopStringLookup[Prelude] then
@@ -4772,6 +4795,81 @@ end
 
 
 
+local function BuildArgsUnpackFallback(CallInfo, Scenario, SerializerError)
+    local Snapshots = GetCallPathSnapshots(CallInfo)
+    local EventSnapshot = Snapshots and Snapshots.Event
+    local EventDeclaration
+    local Prelude
+
+    if EventSnapshot and type(EventSnapshot.Code) == "string" then
+        EventDeclaration = EventSnapshot.Code
+        Prelude = EventSnapshot.Prelude
+    else
+        local Success, Path, PathPrelude = pcall(InstanceSerializer.Serialize, CallInfo.Instance, {
+            VariableName = "Event",
+            DisableNilParentHandler = false,
+            OmitNilFunctionGetterCodeGeneration = true,
+            IgnorePlugins = true,
+        })
+
+        if Success and type(Path) == "string" then
+            EventDeclaration = Path
+            Prelude = PathPrelude
+        else
+            EventDeclaration = "local Event = nil --[[Remote path generation failed]]"
+        end
+    end
+
+    if not string.match(EventDeclaration, "^%s*local%s+Event%s*=") then
+        EventDeclaration = "local Event = " .. EventDeclaration
+    end
+
+    local Arguments = Scenario.Arguments or CallInfo.Arguments or {}
+    local ArgumentCount = Arguments.n or #Arguments
+    local SerializableArguments = {}
+    for Index = 1, ArgumentCount do
+        SerializableArguments[Index] = Arguments[Index]
+    end
+
+    local Success, SerializedArgs, ArgsPrelude = pcall(wax.shared.LuaEncode, SerializableArguments, {
+        Prettify = true,
+        InsertCycles = true,
+        IsArray = true,
+        UseInstancePaths = true,
+        DisableNilParentHandler = false,
+        PathSnapshots = Snapshots,
+    })
+
+    if not Success or type(SerializedArgs) ~= "string" then
+        SerializedArgs = "{} --[[Argument serialization failed: " .. tostring(SerializedArgs) .. "]]"
+    end
+
+    local Method = Scenario.Method or wax.shared.FunctionForClasses.Outgoing[CallInfo.Instance.ClassName]
+    Method = type(Method) == "string" and Method or "FireServer"
+
+    local Parts = {}
+    if type(Prelude) == "string" and Prelude ~= "" then
+        table.insert(Parts, Prelude)
+    end
+    if type(ArgsPrelude) == "string" and ArgsPrelude ~= "" and ArgsPrelude ~= Prelude then
+        table.insert(Parts, ArgsPrelude)
+    end
+    if SerializerError ~= nil then
+        table.insert(Parts, "-- SimpleSpy serializer fallback: " .. tostring(SerializerError))
+    end
+
+    table.insert(Parts, EventDeclaration)
+
+    if ArgumentCount > 0 then
+        table.insert(Parts, "local args = " .. SerializedArgs)
+        table.insert(Parts, "Event:" .. Method .. "(unpack(args))")
+    else
+        table.insert(Parts, "Event:" .. Method .. "()")
+    end
+
+    return table.concat(Parts, "\n\n")
+end
+
 local function CountValues(Values)
 	if type(Values) ~= "table" then
 		return "N/A"
@@ -4845,13 +4943,17 @@ function CodeGen:BuildCallCode(CallInfo: Types.CallInfo)
 
 	if Scenario.Type == "Outgoing" then
 		local Success, Generated = xpcall(BuildSimpleSpyCallCode, function(Error)
-			warn("Cobalt SimpleSpy serializer failed; falling back to native generation:", Error)
+			warn("Cobalt SimpleSpy serializer failed; using args/unpack fallback:", Error)
 			return Error
 		end, CallInfo, Scenario)
 
 		if Success and type(Generated) == "string" and Generated ~= "" then
 			return BuildCodeGenHeader() .. Generated
 		end
+
+		-- Never fall through to Cobalt's native direct-argument renderer for an
+		-- outgoing call. Even an emergency path keeps local Event + local args + unpack.
+		return BuildCodeGenHeader() .. BuildArgsUnpackFallback(CallInfo, Scenario, Generated)
 	end
 
 	-- Plugins and Cobalt's native renderer remain available for incoming calls
@@ -10216,7 +10318,7 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
--- Cobalt SimpleSpy compatibility v13: universal call-card UI/path synchronization.
+-- Cobalt SimpleSpy compatibility v14: universal call-card UI/path synchronization.
 
 local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
 	for _, Object in getnilinstances() do
