@@ -10286,6 +10286,8 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
+-- Cobalt SimpleSpy compatibility v8: bounded low-lag parent/path resolution.
+
 local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
 	for _, Object in getnilinstances() do
 		if Object.Name ~= Name or Object.ClassName ~= ClassName then
@@ -10478,12 +10480,10 @@ local function ReadObjectPosition(Object: Instance): Vector3?
 				end
 			end
 
-			local GetDescendants = Object.GetDescendants
-			for _, Descendant in GetDescendants(Object) do
-				local DescendantIsA = Descendant.IsA
-				if DescendantIsA(Descendant, "BasePart") then
-					return Descendant.Position
-				end
+			local FindFirstChildWhichIsA = Object.FindFirstChildWhichIsA
+			local FirstPart = FindFirstChildWhichIsA(Object, "BasePart", true)
+			if FirstPart then
+				return FirstPart.Position
 			end
 		end
 
@@ -10547,13 +10547,13 @@ local function CaptureOriginRecord(Object: Instance, PositionHint: Vector3?)
 		Name = Name,
 		ClassName = ClassName,
 		DebugId = ReadDebugId(Object),
-		OwnerUserId = DetectOwnerUserId(Object),
-		PositionHint = PositionHint or ReadObjectPosition(Object),
+		OwnerUserId = nil,
+		PositionHint = PositionHint,
 		Suffix = {},
 	}
 
 	local Current = Object
-	for _ = 1, 64 do
+	for _ = 1, 16 do
 		if typeof(Current) ~= "Instance" then
 			break
 		end
@@ -10593,22 +10593,9 @@ local function GetOriginRecords(CallInfo)
 end
 
 local function GetOriginRecord(Records, Target: Instance)
-	if not Records then
-		return nil
-	end
-
-	local Direct = Records[Target]
-	if Direct then
-		return Direct
-	end
-
-	for Reference, Record in next, Records do
-		if typeof(Reference) == "Instance" and IsSameObject(Reference, Target) then
-			return Record
-		end
-	end
-
-	return nil
+	-- Records are keyed by the exact cloned Instance stored in CallInfo.
+	-- Avoid compareinstances/GetDebugId walks on every UI/codegen lookup.
+	return Records and Records[Target] or nil
 end
 
 local function GetCandidateOwnerUserId(Candidate: Instance): number?
@@ -10676,26 +10663,118 @@ local function SquaredDistance(First: Vector3, Second: Vector3): number
 	return X * X + Y * Y + Z * Z
 end
 
+local ResolutionCandidateCache = {}
+local ResolutionCacheLifetime = 0.25
+local ResolutionCandidateLimit = 64
+
+local function AddUniqueResolutionRoot(Roots, Seen, Root)
+	if typeof(Root) ~= "Instance" or Seen[Root] then
+		return
+	end
+
+	Seen[Root] = true
+	table.insert(Roots, Root)
+end
+
+local function GetResolutionRoots()
+	local Roots = {}
+	local Seen = setmetatable({}, { __mode = "k" })
+	local LocalPlayer = wax.shared.LocalPlayer
+
+	if LocalPlayer then
+		AddUniqueResolutionRoot(Roots, Seen, LocalPlayer.Character)
+		AddUniqueResolutionRoot(Roots, Seen, GetLocalBackpack())
+	end
+
+	-- Dropped tools in this game replicate under Workspace.Filter.SpawnedTools.
+	-- Restricting replacement searches to this container prevents both global
+	-- DataModel scans and accidental matches in another player's Backpack.
+	local Workspace
+	pcall(function()
+		local GetService = game.GetService
+		Workspace = GetService(game, "Workspace")
+	end)
+
+	if Workspace then
+		local Filter
+		local SpawnedTools
+		pcall(function()
+			local FindFirstChild = Workspace.FindFirstChild
+			Filter = FindFirstChild(Workspace, "Filter")
+			if Filter then
+				local FilterFindFirstChild = Filter.FindFirstChild
+				SpawnedTools = FilterFindFirstChild(Filter, "SpawnedTools")
+			end
+		end)
+		AddUniqueResolutionRoot(Roots, Seen, SpawnedTools)
+	end
+
+	return Roots
+end
+
+local function CollectBoundedCandidates(Name: string, ClassName: string): { Instance }
+	local CacheKey = ClassName .. "|" .. Name
+	local Now = os.clock()
+	local Cached = ResolutionCandidateCache[CacheKey]
+	if Cached and Now - Cached.Time <= ResolutionCacheLifetime then
+		return Cached.Values
+	end
+
+	local Candidates = {}
+	for _, Root in GetResolutionRoots() do
+		local RootName, RootClass = ReadMetadata(Root)
+		if RootName == Name and RootClass == ClassName then
+			table.insert(Candidates, Root)
+		end
+
+		if #Candidates >= ResolutionCandidateLimit then
+			break
+		end
+
+		local Success, Descendants = pcall(function()
+			local GetDescendants = Root.GetDescendants
+			return GetDescendants(Root)
+		end)
+		if not Success or type(Descendants) ~= "table" then
+			continue
+		end
+
+		for _, Candidate in Descendants do
+			local CandidateName, CandidateClass = ReadMetadata(Candidate)
+			if CandidateName == Name and CandidateClass == ClassName then
+				table.insert(Candidates, Candidate)
+				if #Candidates >= ResolutionCandidateLimit then
+					break
+				end
+			end
+		end
+
+		if #Candidates >= ResolutionCandidateLimit then
+			break
+		end
+	end
+
+	ResolutionCandidateCache[CacheKey] = {
+		Time = Now,
+		Values = Candidates,
+	}
+	return Candidates
+end
+
 local function ResolveLiveInstance(Target: Instance, Record): Instance
 	if typeof(Target) ~= "Instance" or Target == game then
 		return Target
 	end
 
-	-- The exact raw argument is the authoritative reference. This is the key
-	-- difference from the previous name/class resolver, which could select a
-	-- same-class Tool belonging to another player.
-	if Record and typeof(Record.Original) == "Instance" then
-		if ReadParent(Record.Original) ~= nil then
-			return Record.Original
-		end
-
-		if typeof(Record.Resolved) == "Instance" and ReadParent(Record.Resolved) ~= nil then
-			return Record.Resolved
-		end
+	-- Exact references are authoritative and cost O(1).
+	if Record and typeof(Record.Original) == "Instance" and ReadParent(Record.Original) ~= nil then
+		return Record.Original
 	end
-
 	if ReadParent(Target) ~= nil then
 		return Target
+	end
+	if Record and typeof(Record.Resolved) == "Instance" and ReadParent(Record.Resolved) ~= nil then
+		return Record.Resolved
 	end
 
 	local Name, ClassName = ReadMetadata(Target)
@@ -10707,34 +10786,15 @@ local function ResolveLiveInstance(Target: Instance, Record): Instance
 		return Target
 	end
 
-	if Record then
-		local Now = os.clock()
-		if type(Record.LastResolutionAttempt) == "number" and Now - Record.LastResolutionAttempt < 0.05 then
-			return Target
-		end
-		Record.LastResolutionAttempt = Now
-	end
-
-	local DescendantsSuccess, Descendants = pcall(function()
-		local GetDescendants = game.GetDescendants
-		return GetDescendants(game)
-	end)
-	if not DescendantsSuccess or type(Descendants) ~= "table" then
-		return Target
-	end
-
 	local ExactMatches = {}
 	local StructuredMatches = {}
-	local RequiredOwner = Record and Record.OwnerUserId
 	local PositionHint = Record and Record.PositionHint
 
-	for _, Candidate in Descendants do
-		local CandidateName, CandidateClass = ReadMetadata(Candidate)
-		if CandidateName ~= Name or CandidateClass ~= ClassName then
+	for _, Candidate in CollectBoundedCandidates(Name, ClassName) do
+		if ReadParent(Candidate) == nil then
 			continue
 		end
 
-		-- Exact identity/DebugId matches are always safe.
 		local Exact = IsSameObject(Candidate, Target)
 		if not Exact and Record and typeof(Record.Original) == "Instance" then
 			Exact = IsSameObject(Candidate, Record.Original)
@@ -10747,70 +10807,41 @@ local function ResolveLiveInstance(Target: Instance, Record): Instance
 			continue
 		end
 
-		-- Replacement matching is deliberately strict. It must preserve the
-		-- complete target-to-Tool suffix and cannot move a local player's item to
-		-- another player's Character or Backpack.
-		if not Record or not CandidateMatchesSuffix(Candidate, Record) then
-			continue
-		end
-
-		-- A replacement for a generic child such as "Handle" is unsafe unless
-		-- the call-time ancestry identified its containing Tool.
-		if Record.ClassName ~= "Tool" and not Record.ToolName then
-			continue
-		end
-
-		local CandidateOwner = GetCandidateOwnerUserId(Candidate)
-		if RequiredOwner then
-			if CandidateOwner and CandidateOwner ~= RequiredOwner then
-				continue
-			end
-		elseif CandidateOwner then
-			-- Unknown ownership may only fall back to a Workspace object. Never
-			-- infer an arbitrary player's Character/Backpack item.
+		-- Never guess a generic Handle without its Tool ancestry and explicit
+		-- position argument. This prevents cross-tool/cross-player remapping.
+		if
+			not Record
+			or not PositionHint
+			or not CandidateMatchesSuffix(Candidate, Record)
+			or (Record.ClassName ~= "Tool" and not Record.ToolName)
+		then
 			continue
 		end
 
 		local CandidatePosition = ReadObjectPosition(Candidate)
-		table.insert(StructuredMatches, {
-			Instance = Candidate,
-			Distance = PositionHint and CandidatePosition and SquaredDistance(PositionHint, CandidatePosition) or nil,
-		})
+		if CandidatePosition then
+			table.insert(StructuredMatches, {
+				Instance = Candidate,
+				Distance = SquaredDistance(PositionHint, CandidatePosition),
+			})
+		end
 	end
 
 	if #ExactMatches == 1 then
 		if Record then Record.Resolved = ExactMatches[1] end
 		return ExactMatches[1]
-	elseif #ExactMatches > 1 then
-		-- Multiple exact matches indicate an executor identity ambiguity. Do not
-		-- guess; retaining GetNil is safer than generating another player's path.
-		return Target
 	end
 
-	if #StructuredMatches == 1 then
-		if Record then Record.Resolved = StructuredMatches[1].Instance end
-		return StructuredMatches[1].Instance
-	end
-
-	if #StructuredMatches > 1 and PositionHint then
+	if #StructuredMatches > 0 then
 		table.sort(StructuredMatches, function(Left, Right)
-			return (Left.Distance or math.huge) < (Right.Distance or math.huge)
+			return Left.Distance < Right.Distance
 		end)
 
 		local Best = StructuredMatches[1]
 		local Second = StructuredMatches[2]
-		local BestDistance = Best.Distance
-		local SecondDistance = Second and Second.Distance
-
-		-- Select only a geographically plausible, clearly better candidate.
-		-- 64 studs is intentionally generous for drop/pickup replication delay.
 		if
-			type(BestDistance) == "number"
-			and BestDistance <= 64 * 64
-			and (
-				type(SecondDistance) ~= "number"
-				or SecondDistance - BestDistance >= 1
-			)
+			Best.Distance <= 64 * 64
+			and (not Second or Second.Distance - Best.Distance >= 1)
 		then
 			if Record then Record.Resolved = Best.Instance end
 			return Best.Instance
@@ -11173,6 +11204,7 @@ local function GetSimpleSpyCompatConfig()
 	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
 	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
 	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
+	if type(Config.PathCaptureBudget) ~= "number" then Config.PathCaptureBudget = 64 end
 
 	return Config
 end
@@ -11281,6 +11313,50 @@ local function QueueNotification(LogObject, CallIndex: number)
 	}
 end
 
+
+-- One shared queue replaces one coroutine plus up to 60 full path scans per
+-- remote call. Work is capped per Heartbeat so remote spam cannot freeze a frame.
+local PathCaptureQueue = {
+	Items = {},
+	Head = 1,
+	Tail = 0,
+}
+
+local function QueuePathCapture(LogObject, CallIndex: number, CallInfo, RemoteInstance: Instance)
+	PathCaptureQueue.Tail += 1
+	PathCaptureQueue.Items[PathCaptureQueue.Tail] = {
+		Log = LogObject,
+		Index = CallIndex,
+		Info = CallInfo,
+		Remote = RemoteInstance,
+	}
+end
+
+local function ProcessPathCaptureQueue()
+	local Config = GetSimpleSpyCompatConfig()
+	local Budget = tonumber(Config.PathCaptureBudget) or 64
+	Budget = math.clamp(math.floor(Budget), 1, 256)
+
+	local Processed = 0
+	while PathCaptureQueue.Head <= PathCaptureQueue.Tail and Processed < Budget do
+		local Item = PathCaptureQueue.Items[PathCaptureQueue.Head]
+		PathCaptureQueue.Items[PathCaptureQueue.Head] = nil
+		PathCaptureQueue.Head += 1
+		Processed += 1
+
+		if Item and Item.Log.Calls[Item.Index] == Item.Info then
+			pcall(CaptureCallPaths, Item.Info, Item.Remote)
+			QueueNotification(Item.Log, Item.Index)
+		end
+	end
+
+	if PathCaptureQueue.Head > PathCaptureQueue.Tail then
+		table.clear(PathCaptureQueue.Items)
+		PathCaptureQueue.Head = 1
+		PathCaptureQueue.Tail = 0
+	end
+end
+
 --// Auto Ignore Constants \\--
 local SpamCallCountThreshold = 15
 local SpamTimeWindowSeconds = 1
@@ -11288,6 +11364,8 @@ local AutoIgnoreSpammyEvents = false
 
 if not wax.shared.IS_ACTOR then
 	wax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()
+		ProcessPathCaptureQueue()
+
 		local Queue = wax.shared.LogNotificationQueue
 		local Tail = Queue.Tail
 
@@ -11782,48 +11860,9 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	-- Generate paths outside the active hook. A dropped Tool may temporarily have
-	-- Parent == nil before Roblox reparents or replaces it with the replicated
-	-- Workspace instance. Give that transition a few Heartbeats, then publish.
-	local SnapshotInfo = Info
-	local SnapshotRemote = self.Instance
-	local SnapshotLog = self
-	local SnapshotIndex = Index
-
-	local function CaptureAndPublish()
-		if SnapshotLog.Calls[SnapshotIndex] ~= SnapshotInfo then
-			return
-		end
-
-		pcall(CaptureCallPaths, SnapshotInfo, SnapshotRemote)
-		QueueNotification(SnapshotLog, SnapshotIndex)
-	end
-
-	local RunService = wax.shared.RunService
-	if RunService and RunService.Heartbeat then
-		task.spawn(function()
-			for _ = 1, 60 do
-				pcall(function()
-					RunService.Heartbeat:Wait()
-				end)
-
-				local Unresolved = false
-				pcall(function()
-					local OriginRecords = GetOriginRecords(SnapshotInfo)
-					Unresolved = HasUnresolvedInstancePath(SnapshotInfo.Arguments, {}, OriginRecords)
-						or HasUnresolvedInstancePath(SnapshotInfo.InvokeResult, {}, OriginRecords)
-				end)
-
-				if not Unresolved then
-					break
-				end
-			end
-
-			CaptureAndPublish()
-		end)
-	else
-		task.defer(CaptureAndPublish)
-	end
+	-- Defer all Instance traversal to one bounded shared Heartbeat queue.
+	-- This keeps the remote hook fast and prevents hundreds of polling tasks.
+	QueuePathCapture(self, Index, Info, self.Instance)
 
 	return Index
 end
