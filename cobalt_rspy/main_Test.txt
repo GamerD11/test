@@ -4370,25 +4370,9 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	end
 
 	local function GetInstancePath(Target)
-		-- The finalized per-call snapshot is authoritative. Both the UI and
-		-- copied code consume this exact value, eliminating cross-player remaps.
-		local Snapshot = GetSnapshotForInstance(Target)
-		if Snapshot and type(Snapshot.Code) == "string" then
-			AddPrelude(Snapshot.Prelude)
-			if Snapshot.Prelude then
-				GetNilRequired = true
-			end
-			return Snapshot.Code
-		end
-
-		local Resolver = wax.shared.SimpleSpyGetFullPath
-		if type(Resolver) == "function" then
-			local OriginRecord
-			local OriginRecords = Snapshots and Snapshots.OriginRecords
-			if OriginRecords then
-				OriginRecord = OriginRecords[Target]
-			end
-			local Success, Path, Prelude = pcall(Resolver, Target, OriginRecord)
+		local SharedResolver = wax.shared.ResolveSimpleSpyPath
+		if type(SharedResolver) == "function" then
+			local Success, Path, Prelude = pcall(SharedResolver, Target, Snapshots)
 			if Success and type(Path) == "string" then
 				AddPrelude(Prelude)
 				if Prelude then
@@ -4396,6 +4380,16 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 				end
 				return Path
 			end
+		end
+
+		-- Compatibility fallback if the shared resolver was not initialized.
+		local Snapshot = GetSnapshotForInstance(Target)
+		if Snapshot and type(Snapshot.Code) == "string" then
+			AddPrelude(Snapshot.Prelude)
+			if Snapshot.Prelude then
+				GetNilRequired = true
+			end
+			return Snapshot.Code
 		end
 
 		local Success, Path, Prelude = pcall(InstanceSerializer.Serialize, Target, {
@@ -4414,80 +4408,6 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 
 		return "nil --[[Instance path generation failed]]"
 	end
-
-	local function GetRemotePath()
-		local EventSnapshot = Snapshots and Snapshots.Event
-		if EventSnapshot and type(EventSnapshot.Code) == "string" then
-			AddPrelude(EventSnapshot.Prelude)
-			if EventSnapshot.Prelude then
-				GetNilRequired = true
-			end
-
-			return (EventSnapshot.Code:gsub("^local%s+Event%s*=%s*", "", 1))
-		end
-
-		return GetInstancePath(CallInfo.Instance)
-	end
-
-	local function RawToString(Value)
-		local Success, Result = pcall(tostring, Value)
-		return Success and Result or "<tostring failed>"
-	end
-
-	local function FormatString(Value, Indentation)
-		Indentation = Indentation or 0
-		local Limit = math.min(#Value, MaxStringSize)
-		local Result = {}
-		local SourceCharacters = 0
-
-		for Index = 1, Limit do
-			local Byte = string.byte(Value, Index)
-			local Character = string.char(Byte)
-			local Encoded
-
-			if Character == "\n" then
-				Encoded = "\\n"
-			elseif Character == "\t" then
-				Encoded = "\\t"
-			elseif Character == "\r" then
-				Encoded = "\\r"
-			elseif Character == "\\" then
-				Encoded = "\\\\"
-			elseif Character == '"' then
-				Encoded = '\\"'
-			elseif Byte < 32 or Byte > 126 then
-				Encoded = "\\" .. tostring(Byte)
-			else
-				Encoded = Character
-			end
-
-			table.insert(Result, Encoded)
-			SourceCharacters += 1
-
-			if SourceCharacters % 100 == 0 and Index < Limit then
-				table.insert(Result, '" ..\n' .. string.rep(" ", Indentation + IndentSize) .. '"')
-			end
-		end
-
-		local Suffix = ""
-		if #Value > MaxStringSize then
-			Suffix =
-				" --[[ MAXIMUM STRING SIZE REACHED, CHANGE "
-				.. "'getgenv().CobaltSimpleSpyConfig.MaxStringSize' TO ADJUST MAXIMUM SIZE ]]"
-		end
-
-		return '"' .. table.concat(Result) .. '"' .. Suffix
-	end
-
-	local NumberConstants = {
-		["inf"] = "math.huge",
-		["-inf"] = "-math.huge",
-		["nan"] = "0/0",
-	}
-
-	local ValueToString
-	local TableToString
-	local ValueToPath
 
 	local function SerializeFunction(Value)
 		local Name = ""
@@ -10965,6 +10885,79 @@ end
 
 wax.shared.SimpleSpyGetFullPath = SimpleSpyGetFullPath
 
+-- One universal resolver is shared by generated code and the argument UI.
+-- A parented live path always wins over a stale GetNil snapshot. When a live
+-- path becomes available, update the per-call snapshot in place so every UI
+-- surface and later copy operation observes the same value.
+local function FindInstanceSnapshot(Target: Instance, Snapshots)
+	local InstanceSnapshots = Snapshots and Snapshots.Instances
+	if type(InstanceSnapshots) ~= "table" then
+		return nil
+	end
+
+	local Direct = InstanceSnapshots[Target]
+	if Direct then
+		return Direct
+	end
+
+	for Reference, Snapshot in next, InstanceSnapshots do
+		if typeof(Reference) == "Instance" and IsSameObject(Reference, Target) then
+			return Snapshot
+		end
+	end
+
+	return nil
+end
+
+local function IsParentedPath(Path, Prelude): boolean
+	return type(Path) == "string"
+		and Prelude == nil
+		and not string.match(Path, "^GetNil%(")
+		and not string.match(Path, "^nil%s")
+end
+
+local function ResolveSimpleSpyPath(Target: Instance, Snapshots): (string?, string?)
+	if typeof(Target) ~= "Instance" then
+		return nil, nil
+	end
+
+	local OriginRecord
+	local OriginRecords = Snapshots and Snapshots.OriginRecords
+	if type(OriginRecords) == "table" then
+		OriginRecord = OriginRecords[Target]
+	end
+
+	local LivePath, LivePrelude = SimpleSpyGetFullPath(Target, OriginRecord)
+	local Snapshot = FindInstanceSnapshot(Target, Snapshots)
+
+	-- Current parent information is authoritative. Replace stale GetNil data.
+	if IsParentedPath(LivePath, LivePrelude) then
+		if Snapshot then
+			Snapshot.Code = LivePath
+			Snapshot.Prelude = nil
+		end
+		return LivePath, nil
+	end
+
+	-- A previously captured parented path is safer than a transient nil-parent
+	-- result from a cloned reference.
+	if Snapshot and IsParentedPath(Snapshot.Code, Snapshot.Prelude) then
+		return Snapshot.Code, nil
+	end
+
+	if type(LivePath) == "string" then
+		return LivePath, LivePrelude
+	end
+
+	if Snapshot and type(Snapshot.Code) == "string" then
+		return Snapshot.Code, Snapshot.Prelude
+	end
+
+	return nil, nil
+end
+
+wax.shared.ResolveSimpleSpyPath = ResolveSimpleSpyPath
+
 local function BuildInstanceSnapshot(Target: Instance, VariableName: string?, OriginRecord)
 	local Code, Prelude = SimpleSpyGetFullPath(Target, OriginRecord)
 	if type(Code) ~= "string" then
@@ -11065,6 +11058,7 @@ local function GetSimpleSpyCompatConfig()
 	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
 	if type(Config.PathCaptureBudget) ~= "number" then Config.PathCaptureBudget = 64 end
 	if type(Config.PathResolveFrames) ~= "number" then Config.PathResolveFrames = 18 end
+	if type(Config.UIPathResolveFrames) ~= "number" then Config.UIPathResolveFrames = 120 end
 
 	return Config
 end
@@ -19856,6 +19850,52 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 		Parent = Holder,
 	})
 
+
+	-- Temporary nil-parent transitions are common for Tool/Handle remotes.
+	-- Refresh only the currently visible Instance row until the exact original
+	-- reference acquires a parent. This is universal and does not search any
+	-- game-specific folder or call game:GetDescendants().
+	if typeof(Value) == "Instance" then
+		task.spawn(function()
+			local Config = getgenv().CobaltSimpleSpyConfig
+			local MaxFrames = 120
+			if type(Config) == "table" and type(Config.UIPathResolveFrames) == "number" then
+				MaxFrames = math.max(1, math.floor(Config.UIPathResolveFrames))
+			end
+
+			for _ = 1, MaxFrames do
+				if not Holder.Parent or not TextLabel.Parent then
+					return
+				end
+
+				local UpdatedText
+				if IsPreview then
+					UpdatedText = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
+				else
+					UpdatedText = tostring(LazySerializer.QuickSerializeArgument(Value, Options.PathSnapshots))
+						:gsub("<", "&lt;")
+						:gsub(">", "&gt;")
+				end
+
+				if UpdatedText ~= TextLabel.Text then
+					TextLabel.Text = UpdatedText
+					if PreviewCache then
+						PreviewCache[Index] = UpdatedText
+					end
+				end
+
+				-- Stop as soon as a normal parented path is displayed.
+				if not string.find(UpdatedText, "GetNil%(")
+					and not string.find(UpdatedText, "Nil Parent")
+				then
+					return
+				end
+
+				wax.shared.RunService.Heartbeat:Wait()
+			end
+		end)
+	end
+
 	if not IsPreview then
 		local _, TextY = TextBounds.Get(TextLabel.Text, TextLabel.FontFace, TextLabel.TextSize, TextLabel.AbsoluteSize.X)
 		Holder.Size = UDim2.new(1, 0, 0, TextY + 12)
@@ -23250,23 +23290,17 @@ function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 	elseif typeof(Argument) == "table" then
 		return "{...}"
 	elseif typeof(Argument) == "Instance" then
-		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
-		if SnapshotPath then
-			return SnapshotPath
-		end
-
-		local OriginRecord
-		local OriginRecords = PathSnapshots and PathSnapshots.OriginRecords
-		if OriginRecords then
-			OriginRecord = OriginRecords[Argument]
-		end
-
-		local Resolver = wax.shared.SimpleSpyGetFullPath
-		if type(Resolver) == "function" then
-			local Success, Path = pcall(Resolver, Argument, OriginRecord)
+		local SharedResolver = wax.shared.ResolveSimpleSpyPath
+		if type(SharedResolver) == "function" then
+			local Success, Path = pcall(SharedResolver, Argument, PathSnapshots)
 			if Success and type(Path) == "string" then
 				return Path
 			end
+		end
+
+		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
+		if SnapshotPath then
+			return SnapshotPath
 		end
 
 		return InstanceSerializer.Serialize(Argument, { DisableNilParentHandler = true })
