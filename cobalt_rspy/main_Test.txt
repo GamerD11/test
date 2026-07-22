@@ -12452,7 +12452,7 @@ function UI.Apply(Cobalt, Manager, State)
 				["UIListLayout"] = {
 					FillDirection = Enum.FillDirection.Horizontal,
 					HorizontalAlignment = Enum.HorizontalAlignment.Left,
-					VerticalAlignment = Enum.VerticalAlignment.Center,
+					VerticalAlignment = Enum.VerticalAlignment.Top,
 					Padding = UDim.new(0, 5),
 				},
 
@@ -23729,7 +23729,7 @@ return function(props: {
 		},
 	})
 
-	local ActionPanelHeight = 168
+	local ActionPanelHeight = 112
 
 	local LogsList = Interface.New("ScrollingFrame", {
 		BackgroundTransparency = 1,
@@ -23761,8 +23761,8 @@ return function(props: {
 		Parent = LogsWrapper,
 
 		["UIGridLayout"] = {
-			CellPadding = UDim2.fromOffset(5, 4),
-			CellSize = UDim2.new(1 / 3, -4, 0, 24),
+			CellPadding = UDim2.fromOffset(3, 1),
+			CellSize = UDim2.new(1 / 3, -3, 0, 21),
 			FillDirection = Enum.FillDirection.Horizontal,
 			FillDirectionMaxCells = 3,
 			HorizontalAlignment = Enum.HorizontalAlignment.Center,
@@ -23771,10 +23771,10 @@ return function(props: {
 		},
 
 		["UIPadding"] = {
-			PaddingLeft = UDim.new(0, 2),
-			PaddingRight = UDim.new(0, 2),
-			PaddingTop = UDim.new(0, 2),
-			PaddingBottom = UDim.new(0, 2),
+			PaddingLeft = UDim.new(0, 1),
+			PaddingRight = UDim.new(0, 1),
+			PaddingTop = UDim.new(0, 1),
+			PaddingBottom = UDim.new(0, 1),
 		},
 	})
 
@@ -24106,20 +24106,8 @@ return function(props: {
 		CopyToClipboard(Result, "Copied decompiled script", "Failed to copy decompiled script")
 	end)
 
-	local DisableInfoButton
-	DisableInfoButton = CreateRSpyButton("Disable Info", 14, function()
-		local Config = GetCompatConfig()
-		Config.FuncEnabled = not Config.FuncEnabled
-		DisableInfoButton.Text = Config.FuncEnabled and "Disable Info" or "Enable Info"
-		wax.shared.Sonner.success(Config.FuncEnabled and "Function info enabled" or "Function info disabled")
-	end)
-	do
-		local Config = GetCompatConfig()
-		DisableInfoButton.Text = Config.FuncEnabled and "Disable Info" or "Enable Info"
-	end
-
 	local AutoBlockButton
-	AutoBlockButton = CreateRSpyButton("Auto Block: OFF", 15, function()
+	AutoBlockButton = CreateRSpyButton("Auto Block: OFF", 14, function()
 		local Config = GetCompatConfig()
 		Config.AutoBlock = not Config.AutoBlock
 		AutoBlockButton.Text = Config.AutoBlock and "Auto Block: ON" or "Auto Block: OFF"
@@ -24131,7 +24119,7 @@ return function(props: {
 	end
 
 	local LogCheckCallerButton
-	LogCheckCallerButton = CreateRSpyButton("Logcheckcaller", 16, function()
+	LogCheckCallerButton = CreateRSpyButton("Logcheckcaller", 15, function()
 		local Config = GetCompatConfig()
 		Config.LogCheckCaller = not Config.LogCheckCaller
 		LogCheckCallerButton.Text = Config.LogCheckCaller and "Logcheckcaller: ON" or "Logcheckcaller: OFF"
