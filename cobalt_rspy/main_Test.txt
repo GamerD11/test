@@ -1136,24 +1136,14 @@ if CheckFFlagValue("DebugRunParallelLuaOnMainThread", false) and not ExecutorSup
 		function bindable.OnInvoke(response)
 			if response == "Enable Fix" then
 				setfflag("DebugRunParallelLuaOnMainThread", "true")
-				wax.shared.StarterGui:SetCore("SendNotification", {
-					Title = "Cobalt",
-					Text = "Please rejoin for the fix to take effect!",
-					Duration = math.huge,
-				})
+				-- Notifications disabled by user preference.
 			end
 
 			bindable:Destroy()
 		end
 
-		wax.shared.StarterGui:SetCore("SendNotification", {
-			Title = "Cobalt",
-			Text = "This game may use remotes in a way that your executor can't intercept. You can enable the fix and rejoin to detect them.",
-			Duration = math.huge,
-			Callback = bindable,
-			Button1 = "Enable Fix",
-			Button2 = "Dismiss",
-		})
+		-- Notifications disabled by user preference.
+		bindable:Destroy()
 	end)
 end
 
@@ -14824,6 +14814,7 @@ end
 --// Sonner (Notifications) \\--
 local NotificationWrapper = Interface.New("ScrollingFrame", {
 	Name = "Sonner",
+	Visible = false,
 	BackgroundTransparency = 1,
 	Size = UDim2.fromOffset(285, 115),
 	Position = UDim2.fromScale(1, 1),
@@ -23730,10 +23721,12 @@ return function(props: {
 	})
 
 	local ActionPanelHeight = 112
+	local PaginationHeight = 22
+	local ActionPaginationGap = 2
 
 	local LogsList = Interface.New("ScrollingFrame", {
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 1, -(38 + ActionPanelHeight)),
+		Size = UDim2.new(1, 0, 1, -(PaginationHeight + ActionPaginationGap + ActionPanelHeight)),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		CanvasSize = UDim2.new(0, 0, 0, 0),
 		ScrollBarThickness = 2,
@@ -23756,7 +23749,9 @@ return function(props: {
 	local LogsActions = Interface.New("Frame", {
 		AnchorPoint = Vector2.yAxis,
 		BackgroundTransparency = 1,
-		Position = UDim2.new(0, 0, 1, -38),
+		-- Keep the action grid directly above pagination instead of leaving
+		-- a large unused strip at the bottom of the window.
+		Position = UDim2.new(0, 0, 1, -(PaginationHeight + ActionPaginationGap)),
 		Size = UDim2.new(1, 0, 0, ActionPanelHeight),
 		Parent = LogsWrapper,
 
@@ -23783,7 +23778,7 @@ return function(props: {
 		BackgroundColor3 = Color3.fromRGB(25, 25, 25),
 		BackgroundTransparency = 1,
 		Position = UDim2.fromScale(0, 1),
-		Size = UDim2.new(1, 0, 0, 32),
+		Size = UDim2.new(1, 0, 0, PaginationHeight),
 		Parent = LogsWrapper,
 
 		["UIListLayout"] = {
@@ -23866,12 +23861,9 @@ return function(props: {
 		return Cache
 	end
 
-	local function CopyToClipboard(Text: string, SuccessMessage: string, ErrorMessage: string)
+	local function CopyToClipboard(Text: string, _SuccessMessage: string, ErrorMessage: string)
 		local Success, Error = pcall(setclipboard, Text)
-		if Success then
-			wax.shared.Sonner.success(SuccessMessage)
-		else
-			wax.shared.Sonner.error(ErrorMessage)
+		if not Success then
 			warn(ErrorMessage, Error)
 		end
 	end
@@ -23937,7 +23929,6 @@ return function(props: {
 			end
 		end
 
-		wax.shared.Sonner.error("Select a remote or packet first")
 		return nil
 	end
 
@@ -23975,7 +23966,6 @@ return function(props: {
 		Button.MouseButton1Click:Connect(function()
 			local Success, Error = pcall(Callback)
 			if not Success then
-				wax.shared.Sonner.error("Action failed")
 				warn(`Cobalt RSpy action {Text} failed: {Error}`)
 			end
 		end)
@@ -24002,21 +23992,16 @@ return function(props: {
 	CreateRSpyButton("Run Code", 3, function()
 		local CallInfo = RequireSelectedCall()
 		if not CallInfo then return end
-		wax.shared.Sonner.promise(function()
-			CodeGen:ReplayCallInfo(CallInfo)
-		end, {
-			loadingText = "Running call...",
-			successText = "Call executed",
-			errorText = "Call failed",
-			time = 4.5,
-		})
+		local Success, Error = pcall(CodeGen.ReplayCallInfo, CodeGen, CallInfo)
+		if not Success then
+			warn("Cobalt RSpy replay failed:", Error)
+		end
 	end)
 
 	CreateRSpyButton("Get Script", 4, function()
 		local CallInfo = RequireSelectedCall()
 		if not CallInfo then return end
 		if typeof(CallInfo.Origin) ~= "Instance" then
-			wax.shared.Sonner.error("Calling script is unavailable")
 			return
 		end
 		CopyToClipboard(
@@ -24045,7 +24030,6 @@ return function(props: {
 		if not CallInfo then return end
 		local Config = GetCompatConfig()
 		SetExactFilter(Config.Blacklist, CallInfo.Instance)
-		wax.shared.Sonner.success("Remote instance excluded")
 	end)
 
 	CreateRSpyButton("Exclude (n)", 8, function()
@@ -24053,13 +24037,11 @@ return function(props: {
 		if not CallInfo then return end
 		local Config = GetCompatConfig()
 		Config.Blacklist[CallInfo.Instance.Name] = true
-		wax.shared.Sonner.success("Remote name excluded")
 	end)
 
 	CreateRSpyButton("Clr Blacklist", 9, function()
 		local Config = GetCompatConfig()
 		table.clear(Config.Blacklist)
-		wax.shared.Sonner.success("Blacklist cleared")
 	end)
 
 	CreateRSpyButton("Block (i)", 10, function()
@@ -24067,7 +24049,6 @@ return function(props: {
 		if not CallInfo then return end
 		local Config = GetCompatConfig()
 		SetExactFilter(Config.Blocklist, CallInfo.Instance)
-		wax.shared.Sonner.success("Remote instance blocked")
 	end)
 
 	CreateRSpyButton("Block (n)", 11, function()
@@ -24075,30 +24056,25 @@ return function(props: {
 		if not CallInfo then return end
 		local Config = GetCompatConfig()
 		Config.Blocklist[CallInfo.Instance.Name] = true
-		wax.shared.Sonner.success("Remote name blocked")
 	end)
 
 	CreateRSpyButton("Clr Blocklist", 12, function()
 		local Config = GetCompatConfig()
 		table.clear(Config.Blocklist)
-		wax.shared.Sonner.success("Blocklist cleared")
 	end)
 
 	CreateRSpyButton("Decompile", 13, function()
 		local CallInfo = RequireSelectedCall()
 		if not CallInfo then return end
 		if typeof(decompile) ~= "function" then
-			wax.shared.Sonner.error("Decompiler is unavailable")
 			return
 		end
 		if typeof(CallInfo.Origin) ~= "Instance" then
-			wax.shared.Sonner.error("Calling script is unavailable")
 			return
 		end
 
 		local Success, Result = pcall(decompile, CallInfo.Origin)
 		if not Success or type(Result) ~= "string" then
-			wax.shared.Sonner.error("Failed to decompile script")
 			warn("Cobalt RSpy decompile failed:", Result)
 			return
 		end
@@ -24111,7 +24087,6 @@ return function(props: {
 		local Config = GetCompatConfig()
 		Config.AutoBlock = not Config.AutoBlock
 		AutoBlockButton.Text = Config.AutoBlock and "Auto Block: ON" or "Auto Block: OFF"
-		wax.shared.Sonner.success(Config.AutoBlock and "Autoblock enabled" or "Autoblock disabled")
 	end)
 	do
 		local Config = GetCompatConfig()
@@ -24123,9 +24098,6 @@ return function(props: {
 		local Config = GetCompatConfig()
 		Config.LogCheckCaller = not Config.LogCheckCaller
 		LogCheckCallerButton.Text = Config.LogCheckCaller and "Logcheckcaller: ON" or "Logcheckcaller: OFF"
-		wax.shared.Sonner.success(
-			Config.LogCheckCaller and "Executor-fired remotes will be logged" or "Executor-fired remotes will be ignored"
-		)
 	end)
 	do
 		local Config = GetCompatConfig()
