@@ -2215,10 +2215,16 @@ end
 	@param Direction: The direction of the log (Outgoing, Incoming).
 	@return Log: The log for the instance and direction.
 ]]
+local function IsSimpleSpyFunctionInfoEnabled(): boolean
+	local Config = getgenv().CobaltSimpleSpyConfig
+	return type(Config) ~= "table" or Config.FuncEnabled ~= false
+end
+
 local function GetLog(Instance: Instance, Direction: "Outgoing" | "Incoming")
 	local Log = wax.shared.Logs[Direction][Instance]
 	if not Log then
-		Log = wax.shared.NewLog(Instance, Direction, getcallingscript())
+		local CaptureInfo = IsSimpleSpyFunctionInfoEnabled()
+		Log = wax.shared.NewLog(Instance, Direction, CaptureInfo and getcallingscript() or nil)
 	end
 
 	return Log
@@ -2250,12 +2256,13 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 	local Log = GetLog(TargetInstance, "Outgoing")
 	local Arguments = wax.shared.SafePack.Pack(select(2, ...))
 
+	local CaptureInfo = IsSimpleSpyFunctionInfoEnabled()
 	local Info = {
 		Arguments = Arguments,
-		Origin = getcallingscript(),
-		Function = getcallingfunction(),
-		Line = getcallingline(),
-		Source = getcallingsource(),
+		Origin = CaptureInfo and getcallingscript() or nil,
+		Function = CaptureInfo and getcallingfunction() or nil,
+		Line = CaptureInfo and getcallingline() or nil,
+		Source = CaptureInfo and getcallingsource() or nil,
 		IsExecutor = checkcaller(),
 	}
 	local ShouldBlock = Log:ShouldBlock(Info)
@@ -2278,10 +2285,10 @@ local function HandleLogging(TargetInstance: Instance, Method: string, OldFuncti
 		local RFResultInfo = {
 			Arguments = Arguments,
 			InvokeResult = nil,
-			Origin = getcallingscript(),
-			Function = getcallingfunction(),
-			Line = getcallingline(),
-			Source = getcallingsource(),
+			Origin = CaptureInfo and getcallingscript() or nil,
+			Function = CaptureInfo and getcallingfunction() or nil,
+			Line = CaptureInfo and getcallingline() or nil,
+			Source = CaptureInfo and getcallingsource() or nil,
 			IsExecutor = checkcaller(),
 			InvokeKind = "Request",
 		}
@@ -4306,6 +4313,7 @@ local function GetSimpleSpyCompatConfig()
 	if Config.Enabled == nil then Config.Enabled = true end
 	if Config.SerializerEnabled == nil then Config.SerializerEnabled = true end
 	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.FuncEnabled == nil then Config.FuncEnabled = true end
 	if Config.AutoBlock == nil then Config.AutoBlock = false end
 	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
 	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
@@ -11143,6 +11151,7 @@ local function GetSimpleSpyCompatConfig()
 
 	if Config.Enabled == nil then Config.Enabled = true end
 	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.FuncEnabled == nil then Config.FuncEnabled = true end
 	if Config.AutoBlock == nil then Config.AutoBlock = false end
 	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
 	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
@@ -23720,7 +23729,7 @@ return function(props: {
 		},
 	})
 
-	local ActionPanelHeight = 112
+	local ActionPanelHeight = 168
 
 	local LogsList = Interface.New("ScrollingFrame", {
 		BackgroundTransparency = 1,
@@ -23880,6 +23889,15 @@ return function(props: {
 		end
 		if type(Config.Blocklist) ~= "table" then
 			Config.Blocklist = {}
+		end
+		if Config.FuncEnabled == nil then
+			Config.FuncEnabled = true
+		end
+		if Config.AutoBlock == nil then
+			Config.AutoBlock = false
+		end
+		if Config.LogCheckCaller == nil then
+			Config.LogCheckCaller = false
 		end
 
 		return Config
@@ -24065,6 +24083,66 @@ return function(props: {
 		table.clear(Config.Blocklist)
 		wax.shared.Sonner.success("Blocklist cleared")
 	end)
+
+	CreateRSpyButton("Decompile", 13, function()
+		local CallInfo = RequireSelectedCall()
+		if not CallInfo then return end
+		if typeof(decompile) ~= "function" then
+			wax.shared.Sonner.error("Decompiler is unavailable")
+			return
+		end
+		if typeof(CallInfo.Origin) ~= "Instance" then
+			wax.shared.Sonner.error("Calling script is unavailable")
+			return
+		end
+
+		local Success, Result = pcall(decompile, CallInfo.Origin)
+		if not Success or type(Result) ~= "string" then
+			wax.shared.Sonner.error("Failed to decompile script")
+			warn("Cobalt RSpy decompile failed:", Result)
+			return
+		end
+
+		CopyToClipboard(Result, "Copied decompiled script", "Failed to copy decompiled script")
+	end)
+
+	local DisableInfoButton
+	DisableInfoButton = CreateRSpyButton("Disable Info", 14, function()
+		local Config = GetCompatConfig()
+		Config.FuncEnabled = not Config.FuncEnabled
+		DisableInfoButton.Text = Config.FuncEnabled and "Disable Info" or "Enable Info"
+		wax.shared.Sonner.success(Config.FuncEnabled and "Function info enabled" or "Function info disabled")
+	end)
+	do
+		local Config = GetCompatConfig()
+		DisableInfoButton.Text = Config.FuncEnabled and "Disable Info" or "Enable Info"
+	end
+
+	local AutoBlockButton
+	AutoBlockButton = CreateRSpyButton("Auto Block: OFF", 15, function()
+		local Config = GetCompatConfig()
+		Config.AutoBlock = not Config.AutoBlock
+		AutoBlockButton.Text = Config.AutoBlock and "Auto Block: ON" or "Auto Block: OFF"
+		wax.shared.Sonner.success(Config.AutoBlock and "Autoblock enabled" or "Autoblock disabled")
+	end)
+	do
+		local Config = GetCompatConfig()
+		AutoBlockButton.Text = Config.AutoBlock and "Auto Block: ON" or "Auto Block: OFF"
+	end
+
+	local LogCheckCallerButton
+	LogCheckCallerButton = CreateRSpyButton("Logcheckcaller", 16, function()
+		local Config = GetCompatConfig()
+		Config.LogCheckCaller = not Config.LogCheckCaller
+		LogCheckCallerButton.Text = Config.LogCheckCaller and "Logcheckcaller: ON" or "Logcheckcaller: OFF"
+		wax.shared.Sonner.success(
+			Config.LogCheckCaller and "Executor-fired remotes will be logged" or "Executor-fired remotes will be ignored"
+		)
+	end)
+	do
+		local Config = GetCompatConfig()
+		LogCheckCallerButton.Text = Config.LogCheckCaller and "Logcheckcaller: ON" or "Logcheckcaller: OFF"
+	end
 
 	local function GetInitialFilterCondition(CallInfo): Types.QueryBuilderCondition
 		local Value = CallInfo.Arguments and CallInfo.Arguments[1]
