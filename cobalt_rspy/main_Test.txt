@@ -4825,33 +4825,30 @@ function CodeGen:BuildHookCode(CallInfo: Types.CallInfo)
 end
 
 function CodeGen:BuildCallCode(CallInfo: Types.CallInfo)
+	-- Resolve the scenario before plugin interception. Every outgoing replay call
+	-- must use the SimpleSpy-compatible `local args = { ... }` generator so the
+	-- copied format can never be replaced by Cobalt's native `local Event` template.
+	local Scenario = Classifier.DetermineScenario(CallInfo)
+
+	if Scenario.Type == "Outgoing" then
+		local Success, Generated = xpcall(BuildSimpleSpyCallCode, function(Error)
+			warn("Cobalt SimpleSpy serializer failed; falling back to native generation:", Error)
+			return Error
+		end, CallInfo, Scenario)
+
+		if Success and type(Generated) == "string" and Generated ~= "" then
+			return BuildCodeGenHeader() .. Generated
+		end
+	end
+
+	-- Plugins and Cobalt's native renderer remain available for incoming calls
+	-- and as an emergency fallback if outgoing serialization fails.
 	local InterceptedByPlugin, InterceptedCode = InvokePluginHandlers("Call", function(InterceptedCode)
 		return type(InterceptedCode) == "string"
 	end, CallInfo)
 
 	if not InterceptedByPlugin then
 		return InterceptedCode
-	end
-
-	--// Determine Scenario \\--
-	local Scenario = Classifier.DetermineScenario(CallInfo)
-
-	-- SimpleSpy-compatible generation is used only for outgoing replay calls.
-	-- Incoming hook/callback code still uses Cobalt's native renderer.
-	local SimpleSpyConfig = GetSimpleSpyCompatConfig()
-	if
-		SimpleSpyConfig.Enabled
-		and SimpleSpyConfig.SerializerEnabled
-		and Scenario.Type == "Outgoing"
-	then
-		local Success, Generated = xpcall(BuildSimpleSpyCallCode, function(Error)
-			warn("Cobalt SimpleSpy serializer failed; falling back to native generation:", Error)
-			return Error
-		end, CallInfo, Scenario)
-
-		if Success and type(Generated) == "string" then
-			return BuildCodeGenHeader() .. Generated
-		end
 	end
 
 	--// Resolve Template \\--
