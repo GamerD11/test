@@ -4726,19 +4726,32 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 		end
 	end
 
-	local RemotePath = GetRemotePath()
+	-- Reuse the exact event snapshot captured for this call. The previous build
+	-- called an undefined GetRemotePath(), which caused xpcall to fail and made
+	-- Cobalt fall back to its native direct-argument renderer.
+	local EventDeclaration
+	local EventSnapshot = Snapshots and Snapshots.Event
+	if EventSnapshot and type(EventSnapshot.Code) == "string" then
+		EventDeclaration = EventSnapshot.Code
+		AddPrelude(EventSnapshot.Prelude)
+		if EventSnapshot.Prelude then
+			GetNilRequired = true
+		end
+	else
+		EventDeclaration = "local Event = " .. GetInstancePath(CallInfo.Instance)
+	end
+
 	local Method = Scenario.Method or wax.shared.FunctionForClasses.Outgoing[CallInfo.Instance.ClassName]
 	if type(Method) ~= "string" then
 		error("SimpleSpy serializer could not resolve the outgoing method")
 	end
 
-	local Generated = ""
+	local Generated = EventDeclaration .. "\n\n"
 	if ArgumentCount > 0 then
-		Generated = ValueToVariable("args", ArgumentsForSerialization) .. "\n"
-
-		Generated = Generated .. RemotePath .. ":" .. Method .. "(unpack(args))"
+		Generated = Generated .. ValueToVariable("args", ArgumentsForSerialization) .. "\n"
+		Generated = Generated .. "Event:" .. Method .. "(unpack(args))"
 	else
-		Generated = RemotePath .. ":" .. Method .. "()"
+		Generated = Generated .. "Event:" .. Method .. "()"
 	end
 
 	if #TopStrings > 0 then
@@ -10203,7 +10216,7 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
--- Cobalt SimpleSpy compatibility v11: universal call-card UI/path synchronization.
+-- Cobalt SimpleSpy compatibility v13: universal call-card UI/path synchronization.
 
 local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
 	for _, Object in getnilinstances() do
