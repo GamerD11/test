@@ -4275,9 +4275,600 @@ local function InvokePluginHandlers(Type: "Hook" | "Call", ShouldUseResult: (...
 	return true, nil
 end
 
-CodeGen.GetFullPath = InstanceSerializer.Serialize
+CodeGen.GetFullPath = function(Target: Instance)
+	local Resolver = wax.shared.SimpleSpyGetFullPath
+	if type(Resolver) == "function" then
+		local Success, Path = pcall(Resolver, Target)
+		if Success and type(Path) == "string" then
+			return Path
+		end
+	end
+
+	return InstanceSerializer.Serialize(Target)
+end
 
 
+-- SimpleSpy-compatible outgoing call serializer.
+--
+-- This is intentionally isolated to generated replay code. It does not replace
+-- Cobalt's general-purpose LuaEncode serializer and it never executes from the
+-- active remote hook. That keeps the hook return path untouched while matching
+-- SimpleSpy's argument formatting, table reconstruction and value filters.
+local function GetSimpleSpyCompatConfig()
+	local Environment = getgenv()
+	local Config = Environment.CobaltSimpleSpyConfig
+
+	if type(Config) ~= "table" then
+		Config = {}
+		Environment.CobaltSimpleSpyConfig = Config
+	end
+
+	if Config.Enabled == nil then Config.Enabled = true end
+	if Config.SerializerEnabled == nil then Config.SerializerEnabled = true end
+	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.AutoBlock == nil then Config.AutoBlock = false end
+	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
+	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
+	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
+	if type(Config.MaxTableSize) ~= "number" then Config.MaxTableSize = 1000 end
+	if type(Config.MaxStringSize) ~= "number" then Config.MaxStringSize = 10000 end
+	if Config.PreserveNilArguments == nil then Config.PreserveNilArguments = false end
+
+	return Config
+end
+
+local function GetCallPathSnapshots(CallInfo)
+	local Cache = wax.shared.CallPathSnapshots
+	if not Cache then
+		return nil
+	end
+
+	return Cache[CallInfo]
+		or (CallInfo.Arguments and Cache[CallInfo.Arguments])
+		or (CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
+end
+
+-- Local helpers required by the SimpleSpy-compatible serializer.
+-- Earlier builds referenced these names without defining them in this Wax module,
+-- so outgoing code generation threw and silently fell back to Cobalt's native
+-- direct-argument renderer.
+local NumberConstants = {
+    ["inf"] = "math.huge",
+    ["-inf"] = "-math.huge",
+    ["nan"] = "0/0",
+}
+
+local function RawToString(Value)
+    local Success, Result = pcall(tostring, Value)
+    return Success and Result or "<tostring failed>"
+end
+
+local function FormatString(Value)
+    return '"' .. Formatter.FormatLuaString(tostring(Value)) .. '"'
+end
+
+local function BuildSimpleSpyCallCode(CallInfo, Scenario)
+	local Config = GetSimpleSpyCompatConfig()
+	local Snapshots = GetCallPathSnapshots(CallInfo)
+	local IndentSize = 4
+	local TopStrings = {}
+	local TopStringLookup = {}
+	local BottomString = ""
+	local GetNilRequired = false
+	local MaxTableSize = math.max(1, math.floor(Config.MaxTableSize))
+	local MaxStringSize = math.max(1, math.floor(Config.MaxStringSize))
+
+	local ValueToString
+	local TableToString
+	local ValueToPath
+
+	local function AddPrelude(Prelude)
+		if type(Prelude) ~= "string" or Prelude == "" or TopStringLookup[Prelude] then
+			return
+		end
+
+		TopStringLookup[Prelude] = true
+		table.insert(TopStrings, Prelude)
+	end
+
+	local function GetSnapshotForInstance(Target)
+		local InstanceSnapshots = Snapshots and Snapshots.Instances
+		if not InstanceSnapshots then
+			return nil
+		end
+
+		local Direct = InstanceSnapshots[Target]
+		if Direct then
+			return Direct
+		end
+
+		for Reference, Snapshot in next, InstanceSnapshots do
+			local Success, Matches = pcall(InstanceSerializer.IsEqualToInstance, Reference, Target)
+			if Success and Matches then
+				return Snapshot
+			end
+		end
+
+		return nil
+	end
+
+	local function GetInstancePath(Target)
+		local SharedResolver = wax.shared.ResolveSimpleSpyPath
+		if type(SharedResolver) == "function" then
+			local Success, Path, Prelude = pcall(SharedResolver, Target, Snapshots)
+			if Success and type(Path) == "string" then
+				AddPrelude(Prelude)
+				if Prelude then
+					GetNilRequired = true
+				end
+				return Path
+			end
+		end
+
+		-- Compatibility fallback if the shared resolver was not initialized.
+		local Snapshot = GetSnapshotForInstance(Target)
+		if Snapshot and type(Snapshot.Code) == "string" then
+			AddPrelude(Snapshot.Prelude)
+			if Snapshot.Prelude then
+				GetNilRequired = true
+			end
+			return Snapshot.Code
+		end
+
+		local Success, Path, Prelude = pcall(InstanceSerializer.Serialize, Target, {
+			DisableNilParentHandler = false,
+			OmitNilFunctionGetterCodeGeneration = true,
+			IgnorePlugins = true,
+		})
+
+		if Success and type(Path) == "string" then
+			AddPrelude(Prelude)
+			if Prelude then
+				GetNilRequired = true
+			end
+			return Path
+		end
+
+		return "nil --[[Instance path generation failed]]"
+	end
+
+	local function SerializeFunction(Value)
+		local Name = ""
+		pcall(function()
+			Name = debug.info(Value, "n") or ""
+		end)
+
+		if Name ~= "" and string.match(Name, "^[%a_][%w_]*$") then
+			return "function " .. Name .. "() end -- Function Called: " .. Name
+		end
+
+		return "function() end --[[Unsupported function: " .. RawToString(Value) .. "]]"
+	end
+
+	local function SerializeRobloxValue(Value, RobloxType)
+		if RobloxType == "Vector3" then
+			return string.format("Vector3.new(%s, %s, %s)", tostring(Value.X), tostring(Value.Y), tostring(Value.Z))
+		elseif RobloxType == "Vector2" then
+			return string.format("Vector2.new(%s, %s)", tostring(Value.X), tostring(Value.Y))
+		elseif RobloxType == "CFrame" then
+			local Components = { Value:GetComponents() }
+			for Index, Component in Components do
+				Components[Index] = tostring(Component)
+			end
+			return "CFrame.new(" .. table.concat(Components, ", ") .. ")"
+		elseif RobloxType == "Color3" then
+			return string.format("Color3.new(%s, %s, %s)", tostring(Value.R), tostring(Value.G), tostring(Value.B))
+		elseif RobloxType == "UDim" then
+			return string.format("UDim.new(%s, %s)", tostring(Value.Scale), tostring(Value.Offset))
+		elseif RobloxType == "UDim2" then
+			return string.format(
+				"UDim2.new(%s, %s, %s, %s)",
+				tostring(Value.X.Scale),
+				tostring(Value.X.Offset),
+				tostring(Value.Y.Scale),
+				tostring(Value.Y.Offset)
+			)
+		elseif RobloxType == "Rect" then
+			return string.format(
+				"Rect.new(%s, %s, %s, %s)",
+				tostring(Value.Min.X),
+				tostring(Value.Min.Y),
+				tostring(Value.Max.X),
+				tostring(Value.Max.Y)
+			)
+		elseif RobloxType == "Ray" then
+			return "Ray.new(" .. SerializeRobloxValue(Value.Origin, "Vector3")
+				.. ", " .. SerializeRobloxValue(Value.Direction, "Vector3") .. ")"
+		elseif RobloxType == "BrickColor" then
+			return "BrickColor.new(" .. tostring(Value.Number) .. ")"
+		elseif RobloxType == "NumberRange" then
+			return string.format("NumberRange.new(%s, %s)", tostring(Value.Min), tostring(Value.Max))
+		elseif RobloxType == "TweenInfo" then
+			return string.format(
+				"TweenInfo.new(%s, %s, %s, %s, %s, %s)",
+				tostring(Value.Time),
+				tostring(Value.EasingStyle),
+				tostring(Value.EasingDirection),
+				tostring(Value.RepeatCount),
+				tostring(Value.Reverses),
+				tostring(Value.DelayTime)
+			)
+		elseif RobloxType == "Region3" then
+			local Center = Value.CFrame.Position
+			local HalfSize = Value.Size / 2
+			return "Region3.new("
+				.. SerializeRobloxValue(Center - HalfSize, "Vector3")
+				.. ", "
+				.. SerializeRobloxValue(Center + HalfSize, "Vector3")
+				.. ")"
+		elseif RobloxType == "Faces" then
+			local Faces = {}
+			for _, Name in { "Top", "Bottom", "Left", "Right", "Back", "Front" } do
+				if Value[Name] then
+					table.insert(Faces, "Enum.NormalId." .. Name)
+				end
+			end
+			return "Faces.new(" .. table.concat(Faces, ", ") .. ")"
+		elseif RobloxType == "PathWaypoint" then
+			return "PathWaypoint.new("
+				.. SerializeRobloxValue(Value.Position, "Vector3")
+				.. ", " .. tostring(Value.Action)
+				.. ", " .. FormatString(Value.Label or "", 0)
+				.. ")"
+		elseif RobloxType == "EnumItem" or RobloxType == "Enums" or RobloxType == "Enum" then
+			return tostring(Value)
+		elseif RobloxType == "RBXScriptSignal" then
+			return "nil --[[RBXScriptSignal values cannot be sent to the server]]"
+		elseif RobloxType == "RBXScriptConnection" then
+			return "nil --[[RBXScriptConnection values cannot be sent to the server]]"
+		elseif RobloxType == "buffer" and buffer and buffer.tostring then
+			local Success, BufferString = pcall(buffer.tostring, Value)
+			if Success then
+				return "buffer.fromstring(" .. FormatString(BufferString, 0) .. ")"
+			end
+		elseif RobloxType == "Instance" then
+			return GetInstancePath(Value)
+		end
+
+		return nil
+	end
+
+	ValueToPath = function(Target, SearchTable, Path, Visited)
+		Path = Path or ""
+		Visited = Visited or {}
+
+		if rawequal(Target, SearchTable) then
+			return true, ""
+		end
+		if Visited[SearchTable] then
+			return false, ""
+		end
+		Visited[SearchTable] = true
+
+		for Key, Value in next, SearchTable do
+			local KeyPath
+			if type(Key) == "string" and string.match(Key, "^[%a_][%w_]*$") then
+				KeyPath = "." .. Key
+			else
+				KeyPath = "[" .. ValueToString(Key) .. "]"
+			end
+
+			if rawequal(Value, Target) then
+				return true, Path .. KeyPath
+			end
+
+			if type(Value) == "table" then
+				local Found, ChildPath = ValueToPath(Target, Value, Path .. KeyPath, Visited)
+				if Found then
+					return true, ChildPath
+				end
+			end
+		end
+
+		return false, ""
+	end
+
+	TableToString = function(CurrentTable, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		Path = Path or ""
+		Level = Level or 0
+		ParentTable = ParentTable or CurrentTable
+		Tables = Tables or {}
+
+		for _, Previous in next, Tables do
+			if VariableName and rawequal(Previous, CurrentTable) then
+				local _, ExistingPath = ValueToPath(CurrentTable, ParentTable)
+				BottomString = BottomString
+					.. "\n"
+					.. tostring(VariableName)
+					.. tostring(Path)
+					.. " = "
+					.. tostring(VariableName)
+					.. tostring(ExistingPath)
+				return "{} --[[DUPLICATE]]"
+			end
+		end
+
+		table.insert(Tables, CurrentTable)
+
+		local Output = "{"
+		local Size = 0
+		local ChildLevel = Level + IndentSize
+
+		local MaximumNumericIndex = 0
+		local PureNumeric = true
+		for Key in next, CurrentTable do
+			if type(Key) == "number" and Key > 0 and Key == math.floor(Key) then
+				MaximumNumericIndex = math.max(MaximumNumericIndex, Key)
+			else
+				PureNumeric = false
+				break
+			end
+		end
+
+		if PureNumeric and MaximumNumericIndex > 0 then
+			for NumericIndex = 1, MaximumNumericIndex do
+				Size += 1
+				if Size > MaxTableSize then
+					Output = Output
+						.. "\n"
+						.. string.rep(" ", ChildLevel)
+						.. "-- MAXIMUM TABLE SIZE REACHED, CHANGE "
+						.. "'getgenv().CobaltSimpleSpyConfig.MaxTableSize' TO ADJUST MAXIMUM SIZE "
+					break
+				end
+
+				local Value = CurrentTable[NumericIndex]
+				local ValueString = Value == nil and "nil"
+					or ValueToString(
+						Value,
+						ChildLevel,
+						ParentTable,
+						VariableName,
+						IsVariable,
+						NumericIndex,
+						CurrentTable,
+						Path .. "[" .. tostring(NumericIndex) .. "]",
+						Tables
+					)
+
+				Output = Output
+					.. "\n"
+					.. string.rep(" ", ChildLevel)
+					.. "["
+					.. tostring(NumericIndex)
+					.. "] = "
+					.. ValueString
+					.. ","
+			end
+		else
+			for Key, Value in next, CurrentTable do
+				Size += 1
+				if Size > MaxTableSize then
+					Output = Output
+						.. "\n"
+						.. string.rep(" ", ChildLevel)
+						.. "-- MAXIMUM TABLE SIZE REACHED, CHANGE "
+						.. "'getgenv().CobaltSimpleSpyConfig.MaxTableSize' TO ADJUST MAXIMUM SIZE "
+					break
+				end
+
+				if rawequal(Key, CurrentTable) then
+					local ValueString = rawequal(Value, Key)
+							and (tostring(VariableName) .. tostring(Path))
+						or ValueToString(Value, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path, Tables)
+					BottomString = BottomString
+						.. "\n"
+						.. tostring(VariableName)
+						.. tostring(Path)
+						.. "["
+						.. tostring(VariableName)
+						.. tostring(Path)
+						.. "] = "
+						.. ValueString
+					Size -= 1
+					continue
+				end
+
+				local CurrentPath
+				if type(Key) == "string" and string.match(Key, "^[%a_][%w_]*$") then
+					CurrentPath = "." .. Key
+				else
+					CurrentPath = "[" .. ValueToString(Key) .. "]"
+				end
+
+				Output = Output
+					.. "\n"
+					.. string.rep(" ", ChildLevel)
+					.. "["
+					.. ValueToString(Key, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path .. CurrentPath, Tables)
+					.. "] = "
+					.. ValueToString(Value, ChildLevel, ParentTable, VariableName, IsVariable, Key, CurrentTable, Path .. CurrentPath, Tables)
+					.. ","
+			end
+		end
+
+		if string.sub(Output, -1) == "," then
+			Output = string.sub(Output, 1, -2)
+		end
+		if Size > 0 then
+			Output = Output .. "\n" .. string.rep(" ", Level)
+		end
+
+		return Output .. "}"
+	end
+
+	ValueToString = function(Value, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		local RobloxType = typeof(Value)
+		local LuaType = type(Value)
+
+		if Value == nil then
+			return "nil"
+		elseif RobloxType == "Instance" then
+			return GetInstancePath(Value)
+		elseif LuaType == "number" then
+			return NumberConstants[tostring(Value)] or tostring(Value)
+		elseif LuaType == "boolean" then
+			return tostring(Value)
+		elseif LuaType == "string" then
+			return FormatString(Value, Level or 0)
+		elseif LuaType == "table" then
+			return TableToString(Value, Level, ParentTable, VariableName, IsVariable, Index, PreviousTable, Path, Tables)
+		elseif LuaType == "function" then
+			return SerializeFunction(Value)
+		end
+
+		local RobloxValue = SerializeRobloxValue(Value, RobloxType)
+		if RobloxValue then
+			return RobloxValue
+		end
+
+		if LuaType == "userdata" then
+			return "newproxy(true)"
+		elseif LuaType == "thread" then
+			return "nil --[[thread values cannot be sent to the server]]"
+		end
+
+		return "nil --[[Generation Failure: " .. tostring(RobloxType) .. " (" .. RawToString(Value) .. ")]]"
+	end
+
+	local function ValueToVariable(Name, Value)
+		local Result = "local " .. Name .. " = " .. ValueToString(Value, nil, nil, Name, true) .. "\n"
+		if BottomString ~= "" then
+			Result = Result .. BottomString .. "\n"
+		end
+
+		return Result
+	end
+
+	local Arguments = Scenario.Arguments or CallInfo.Arguments or {}
+	local ArgumentCount = Arguments.n or #Arguments
+	local ArgumentsForSerialization = {}
+	for Key, Value in next, Arguments do
+		if Key ~= "n" then
+			ArgumentsForSerialization[Key] = Value
+		end
+	end
+
+	-- Reuse the exact event snapshot captured for this call. The previous build
+	-- called an undefined GetRemotePath(), which caused xpcall to fail and made
+	-- Cobalt fall back to its native direct-argument renderer.
+	local EventDeclaration
+	local EventSnapshot = Snapshots and Snapshots.Event
+	if EventSnapshot and type(EventSnapshot.Code) == "string" then
+		EventDeclaration = EventSnapshot.Code
+		AddPrelude(EventSnapshot.Prelude)
+		if EventSnapshot.Prelude then
+			GetNilRequired = true
+		end
+	else
+		EventDeclaration = "local Event = " .. GetInstancePath(CallInfo.Instance)
+	end
+
+	local Method = Scenario.Method or wax.shared.FunctionForClasses.Outgoing[CallInfo.Instance.ClassName]
+	if type(Method) ~= "string" then
+		error("SimpleSpy serializer could not resolve the outgoing method")
+	end
+
+	local Generated = EventDeclaration .. "\n\n"
+	if ArgumentCount > 0 then
+		Generated = Generated .. ValueToVariable("args", ArgumentsForSerialization) .. "\n"
+		Generated = Generated .. "Event:" .. Method .. "(unpack(args))"
+	else
+		Generated = Generated .. "Event:" .. Method .. "()"
+	end
+
+	if #TopStrings > 0 then
+		Generated = table.concat(TopStrings, "\n\n") .. "\n\n" .. Generated
+	elseif GetNilRequired then
+		Generated =
+			"function getNil(name,class) for _,v in next, getnilinstances() do "
+			.. "if v.ClassName==class and v.Name==name then return v end end end\n\n"
+			.. Generated
+	end
+
+	if CallInfo.Blocked then
+		Generated = "-- THIS REMOTE WAS PREVENTED FROM FIRING TO THE SERVER\n\n" .. Generated
+	end
+
+	return Generated
+end
+
+
+
+local function BuildArgsUnpackFallback(CallInfo, Scenario, SerializerError)
+    local Snapshots = GetCallPathSnapshots(CallInfo)
+    local EventSnapshot = Snapshots and Snapshots.Event
+    local EventDeclaration
+    local Prelude
+
+    if EventSnapshot and type(EventSnapshot.Code) == "string" then
+        EventDeclaration = EventSnapshot.Code
+        Prelude = EventSnapshot.Prelude
+    else
+        local Success, Path, PathPrelude = pcall(InstanceSerializer.Serialize, CallInfo.Instance, {
+            VariableName = "Event",
+            DisableNilParentHandler = false,
+            OmitNilFunctionGetterCodeGeneration = true,
+            IgnorePlugins = true,
+        })
+
+        if Success and type(Path) == "string" then
+            EventDeclaration = Path
+            Prelude = PathPrelude
+        else
+            EventDeclaration = "local Event = nil --[[Remote path generation failed]]"
+        end
+    end
+
+    if not string.match(EventDeclaration, "^%s*local%s+Event%s*=") then
+        EventDeclaration = "local Event = " .. EventDeclaration
+    end
+
+    local Arguments = Scenario.Arguments or CallInfo.Arguments or {}
+    local ArgumentCount = Arguments.n or #Arguments
+    local SerializableArguments = {}
+    for Index = 1, ArgumentCount do
+        SerializableArguments[Index] = Arguments[Index]
+    end
+
+    local Success, SerializedArgs, ArgsPrelude = pcall(wax.shared.LuaEncode, SerializableArguments, {
+        Prettify = true,
+        InsertCycles = true,
+        IsArray = true,
+        UseInstancePaths = true,
+        DisableNilParentHandler = false,
+        PathSnapshots = Snapshots,
+    })
+
+    if not Success or type(SerializedArgs) ~= "string" then
+        SerializedArgs = "{} --[[Argument serialization failed: " .. tostring(SerializedArgs) .. "]]"
+    end
+
+    local Method = Scenario.Method or wax.shared.FunctionForClasses.Outgoing[CallInfo.Instance.ClassName]
+    Method = type(Method) == "string" and Method or "FireServer"
+
+    local Parts = {}
+    if type(Prelude) == "string" and Prelude ~= "" then
+        table.insert(Parts, Prelude)
+    end
+    if type(ArgsPrelude) == "string" and ArgsPrelude ~= "" and ArgsPrelude ~= Prelude then
+        table.insert(Parts, ArgsPrelude)
+    end
+    if SerializerError ~= nil then
+        table.insert(Parts, "-- SimpleSpy serializer fallback: " .. tostring(SerializerError))
+    end
+
+    table.insert(Parts, EventDeclaration)
+
+    if ArgumentCount > 0 then
+        table.insert(Parts, "local args = " .. SerializedArgs)
+        table.insert(Parts, "Event:" .. Method .. "(unpack(args))")
+    else
+        table.insert(Parts, "Event:" .. Method .. "()")
+    end
+
+    return table.concat(Parts, "\n\n")
+end
 
 local function CountValues(Values)
 	if type(Values) ~= "table" then
@@ -4345,6 +4936,28 @@ function CodeGen:BuildHookCode(CallInfo: Types.CallInfo)
 end
 
 function CodeGen:BuildCallCode(CallInfo: Types.CallInfo)
+	-- Resolve the scenario before plugin interception. Every outgoing replay call
+	-- must use the SimpleSpy-compatible `local args = { ... }` generator so the
+	-- copied format can never be replaced by Cobalt's native `local Event` template.
+	local Scenario = Classifier.DetermineScenario(CallInfo)
+
+	if Scenario.Type == "Outgoing" then
+		local Success, Generated = xpcall(BuildSimpleSpyCallCode, function(Error)
+			warn("Cobalt SimpleSpy serializer failed; using args/unpack fallback:", Error)
+			return Error
+		end, CallInfo, Scenario)
+
+		if Success and type(Generated) == "string" and Generated ~= "" then
+			return BuildCodeGenHeader() .. Generated
+		end
+
+		-- Never fall through to Cobalt's native direct-argument renderer for an
+		-- outgoing call. Even an emergency path keeps local Event + local args + unpack.
+		return BuildCodeGenHeader() .. BuildArgsUnpackFallback(CallInfo, Scenario, Generated)
+	end
+
+	-- Plugins and Cobalt's native renderer remain available for incoming calls
+	-- and as an emergency fallback if outgoing serialization fails.
 	local InterceptedByPlugin, InterceptedCode = InvokePluginHandlers("Call", function(InterceptedCode)
 		return type(InterceptedCode) == "string"
 	end, CallInfo)
@@ -4352,9 +4965,6 @@ function CodeGen:BuildCallCode(CallInfo: Types.CallInfo)
 	if not InterceptedByPlugin then
 		return InterceptedCode
 	end
-
-	--// Determine Scenario \\--
-	local Scenario = Classifier.DetermineScenario(CallInfo)
 
 	--// Resolve Template \\--
 	local Template = Renderer.ResolveTemplate("Call", Scenario)
@@ -4534,6 +5144,18 @@ local ReferencingTemplate = require(script.Parent.Templates.Referencing)
 local GetNilCode = ReferencingTemplate.GetNilCode
 
 local InstanceSerializer = require(script.Parent.Serializer.Instance)
+
+local function GetCallPathSnapshots(CallInfo)
+	local Cache = wax.shared.CallPathSnapshots
+	if not Cache or not CallInfo then
+		return nil
+	end
+
+	return Cache[CallInfo]
+		or (CallInfo.Arguments and Cache[CallInfo.Arguments])
+		or (CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
+end
+
 local ResolveEventPath
 do
 	--#region @export "FindEventReferenceInTable"
@@ -4669,6 +5291,12 @@ do
 	--#endregion
 
 	ResolveEventPath = function(CallInfo: Types.CallInfo): (string, string?)
+		local Snapshots = GetCallPathSnapshots(CallInfo)
+		local EventSnapshot = Snapshots and Snapshots.Event
+		if EventSnapshot then
+			return EventSnapshot.Code, EventSnapshot.Prelude
+		end
+
 		return InstanceSerializer.Serialize(CallInfo.Instance, {
 			VariableName = "Event",
 			DisableNilParentHandler = false,
@@ -4800,6 +5428,7 @@ function Renderer.DeriveVariables(
 			Prettify = true,
 			InsertCycles = true,
 			IsArray = true,
+			PathSnapshots = GetCallPathSnapshots(Data.CallInfo),
 		})
 
 		local ExpectedResult, ExpectedResultRequiresNilHandler = nil, false
@@ -4819,6 +5448,7 @@ function Renderer.DeriveVariables(
 				Prettify = true,
 				InsertCycles = true,
 				IsArray = true,
+				PathSnapshots = GetCallPathSnapshots(Data.CallInfo),
 			})
 
 			Variables.ExpectedResultCode = "\n\nlocal ExpectedResult = table.unpack(" .. ExpectedResult .. ")\n"
@@ -5353,6 +5983,7 @@ local function LuaEncode(inputTable, options)
     CheckType(options.SerializeMathHuge, "options.SerializeMathHuge", "boolean", "nil")
     CheckType(options.DisableNilParentHandler, "options.DisableNilParentHandler", "boolean", "nil")
     CheckType(options.IsArray, "options.IsArray", "boolean", "nil")
+    CheckType(options.PathSnapshots, "options.PathSnapshots", "table", "nil")
 
     CheckType(options._StackLevel, "options._StackLevel", "number", "nil")
     CheckType(options._VisitedTables, "options._VisitedTables", "table", "nil")
@@ -5368,6 +5999,7 @@ local function LuaEncode(inputTable, options)
     local DisableNilParentHandler = options.DisableNilParentHandler or false
     local SerializeMathHuge = (options.SerializeMathHuge == nil and true) or options.SerializeMathHuge
     local IsArray = (options.IsArray == nil and false) or options.IsArray
+    local PathSnapshots = options.PathSnapshots
 
     local StackLevelOpt = options._StackLevel or 1
     local VisitedTables = options._VisitedTables or {} -- [Ref: table] = true
@@ -5694,9 +6326,21 @@ local function LuaEncode(inputTable, options)
             return "Content.none" .. BlankSeperator .. CommentBlock("Content source=" .. tostring(source))
         end
 
-        -- Instance refs can be evaluated to their paths (optional), but if parented to
-        -- nil or some DataModel not under `game`, it'll just return nil
+        -- Use the immutable path captured while the remote call was still active.
+        -- The snapshot map is keyed by the exact cloned Instance stored in CallInfo.
         TypeCases["Instance"] = function(value)
+            local Snapshot = PathSnapshots
+                and PathSnapshots.Instances
+                and PathSnapshots.Instances[value]
+
+            if Snapshot then
+                if Snapshot.Prelude then
+                    DidInsertNilFunction = true
+                end
+
+                return Snapshot.Code
+            end
+
             if UseInstancePaths then
                 local InstancePath, NilFunctionInserted = SerializeInstance(value, {
                     DisableNilParentHandler = DisableNilParentHandler,
@@ -9674,7 +10318,948 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
+-- Cobalt SimpleSpy compatibility v14: universal call-card UI/path synchronization.
+
+local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
+	for _, Object in getnilinstances() do
+		if Object.Name ~= Name or Object.ClassName ~= ClassName then
+			continue
+		end
+
+		if DebugId == nil then
+			return Object
+		end
+
+		local Success, ObjectDebugId = pcall(Object.GetDebugId, Object)
+		if Success and ObjectDebugId == DebugId then
+			return Object
+		end
+	end
+end]]
+
+-- Call-time paths must be captured without invoking Instance methods through
+-- ':' syntax. A nested engine namecall inside the active __namecall hook can
+-- overwrite getnamecallmethod() and corrupt the original FireServer/InvokeServer.
+wax.shared.CallPathSnapshots = wax.shared.CallPathSnapshots
+	or setmetatable({}, { __mode = "k" })
+
+local function Quote(Value): string
+	return string.format("%q", tostring(Value))
+end
+
+local function BuildStaticAccessor(Name: string, LookupMode: string): string
+	if LookupMode == "WaitForChild" then
+		return ":WaitForChild(" .. Quote(Name) .. ")"
+	elseif LookupMode == "FindFirstChild" then
+		return ":FindFirstChild(" .. Quote(Name) .. ")"
+	elseif string.match(Name, "^[%a_][%w_]*$") then
+		return "." .. Name
+	end
+
+	return "[" .. Quote(Name) .. "]"
+end
+
+local function ReadDebugId(Object: Instance): string?
+	local Success, Result = pcall(function()
+		local GetDebugId = Object.GetDebugId
+		return GetDebugId(Object)
+	end)
+
+	return Success and type(Result) == "string" and Result or nil
+end
+
+local function ReadChildren(Parent: Instance): { Instance }?
+	local Success, Result = pcall(function()
+		local GetChildren = Parent.GetChildren
+		return GetChildren(Parent)
+	end)
+
+	return Success and type(Result) == "table" and Result or nil
+end
+
+local function ReadParent(Object: Instance): Instance?
+	local Success, Parent = pcall(function()
+		return Object.Parent
+	end)
+
+	if not Success then
+		return nil
+	end
+
+	return typeof(Parent) == "Instance" and Parent or nil
+end
+
+local function IsSameObject(First: Instance, Second: Instance): boolean
+	if rawequal(First, Second) or First == Second then
+		return true
+	end
+
+	if type(compareinstances) == "function" then
+		local Success, Matches = pcall(compareinstances, First, Second)
+		if Success and Matches == true then
+			return true
+		end
+	end
+
+	local FirstDebugId = ReadDebugId(First)
+	local SecondDebugId = ReadDebugId(Second)
+	return FirstDebugId ~= nil and FirstDebugId == SecondDebugId
+end
+
+local function IsDescendantOrSelf(Object: Instance, Ancestor: Instance): boolean
+	if IsSameObject(Object, Ancestor) then
+		return true
+	end
+
+	local Success, Result = pcall(function()
+		local IsDescendantOf = Object.IsDescendantOf
+		return IsDescendantOf(Object, Ancestor)
+	end)
+
+	return Success and Result == true
+end
+
+-- Track the exact raw Instance received by the hook. Cobalt clones argument
+-- references before storing calls; some executor cloneref implementations can
+-- temporarily report a stale nil Parent. The original reference is therefore
+-- retained per call and is always preferred over heuristic replacement.
+wax.shared.CallOriginRecords = wax.shared.CallOriginRecords
+	or setmetatable({}, { __mode = "k" })
+
+local function ReadMetadata(Object: Instance): (string?, string?)
+	local Name
+	local ClassName
+	local Success = pcall(function()
+		Name = Object.Name
+		ClassName = Object.ClassName
+	end)
+
+	if not Success or type(Name) ~= "string" or type(ClassName) ~= "string" then
+		return nil, nil
+	end
+
+	return Name, ClassName
+end
+
+local function FindPositionHint(Value, Visited): Vector3?
+	local ValueType = typeof(Value)
+	if ValueType == "Vector3" then
+		return Value
+	elseif ValueType == "CFrame" then
+		return Value.Position
+	end
+
+	if type(Value) ~= "table" then
+		return nil
+	end
+
+	Visited = Visited or {}
+	if Visited[Value] then
+		return nil
+	end
+	Visited[Value] = true
+
+	-- Numeric arguments are checked first so common remote layouts such as
+	-- (Tool, nil, Position) use the explicit position argument deterministically.
+	local Length = rawget(Value, "n")
+	if type(Length) ~= "number" then
+		local Success, RawLength = pcall(rawlen, Value)
+		Length = Success and RawLength or 0
+	end
+	Length = math.max(0, math.floor(Length))
+	for Index = 1, Length do
+		local Result = FindPositionHint(rawget(Value, Index), Visited)
+		if Result then
+			return Result
+		end
+	end
+
+	for Key, Child in next, Value do
+		if type(Key) ~= "number" then
+			local Result = FindPositionHint(Child, Visited)
+			if Result then
+				return Result
+			end
+		end
+	end
+
+	return nil
+end
+
+local function ReadObjectPosition(Object: Instance): Vector3?
+	local Success, Position = pcall(function()
+		local IsA = Object.IsA
+		if IsA(Object, "BasePart") then
+			return Object.Position
+		end
+
+		if IsA(Object, "Attachment") then
+			return Object.WorldPosition
+		end
+
+		if IsA(Object, "Model") then
+			local GetPivot = Object.GetPivot
+			return GetPivot(Object).Position
+		end
+
+		if IsA(Object, "Tool") then
+			local FindFirstChild = Object.FindFirstChild
+			local Handle = FindFirstChild(Object, "Handle", true)
+			if Handle then
+				local HandleIsA = Handle.IsA
+				if HandleIsA(Handle, "BasePart") then
+					return Handle.Position
+				end
+			end
+
+			local FindFirstChildWhichIsA = Object.FindFirstChildWhichIsA
+			local FirstPart = FindFirstChildWhichIsA(Object, "BasePart", true)
+			if FirstPart then
+				return FirstPart.Position
+			end
+		end
+
+		return nil
+	end)
+
+	return Success and typeof(Position) == "Vector3" and Position or nil
+end
+
+local function ReadUserId(Player: Instance): number?
+	local Success, UserId = pcall(function()
+		return Player.UserId
+	end)
+	return Success and type(UserId) == "number" and UserId or nil
+end
+
+local function GetLocalBackpack(): Instance?
+	local Backpack
+	pcall(function()
+		local FindFirstChildOfClass = wax.shared.LocalPlayer.FindFirstChildOfClass
+		Backpack = FindFirstChildOfClass(wax.shared.LocalPlayer, "Backpack")
+	end)
+	return typeof(Backpack) == "Instance" and Backpack or nil
+end
+
+local function DetectOwnerUserId(Object: Instance): number?
+	local LocalPlayer = wax.shared.LocalPlayer
+	local LocalCharacter = LocalPlayer and LocalPlayer.Character
+	local LocalBackpack = LocalPlayer and GetLocalBackpack()
+	local Current = Object
+
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" then
+			break
+		end
+
+		if LocalCharacter and IsSameObject(Current, LocalCharacter) then
+			return LocalPlayer.UserId
+		end
+		if LocalBackpack and IsSameObject(Current, LocalBackpack) then
+			return LocalPlayer.UserId
+		end
+		if Current.ClassName == "Player" then
+			return ReadUserId(Current)
+		end
+
+		Current = ReadParent(Current)
+	end
+
+	return nil
+end
+
+local function CaptureOriginRecord(Object: Instance, PositionHint: Vector3?)
+	local Name, ClassName = ReadMetadata(Object)
+	if not Name or not ClassName then
+		return nil
+	end
+
+	local Record = {
+		Original = Object,
+		Name = Name,
+		ClassName = ClassName,
+		DebugId = ReadDebugId(Object),
+		OwnerUserId = nil,
+		PositionHint = PositionHint,
+		Suffix = {},
+	}
+
+	local Current = Object
+	for _ = 1, 16 do
+		if typeof(Current) ~= "Instance" then
+			break
+		end
+
+		local CurrentName, CurrentClass = ReadMetadata(Current)
+		if not CurrentName or not CurrentClass then
+			break
+		end
+
+		table.insert(Record.Suffix, {
+			Name = CurrentName,
+			ClassName = CurrentClass,
+		})
+
+		if CurrentClass == "Tool" then
+			Record.ToolName = CurrentName
+			Record.ToolClassName = CurrentClass
+			Record.ToolDebugId = ReadDebugId(Current)
+			break
+		end
+
+		Current = ReadParent(Current)
+	end
+
+	return Record
+end
+
+local function GetOriginRecords(CallInfo)
+	local Cache = wax.shared.CallOriginRecords
+	if not Cache then
+		return nil
+	end
+
+	return Cache[CallInfo]
+		or (CallInfo and CallInfo.Arguments and Cache[CallInfo.Arguments])
+		or (CallInfo and CallInfo.InvokeResult and Cache[CallInfo.InvokeResult])
+end
+
+local function GetOriginRecord(Records, Target: Instance)
+	-- Records are keyed by the exact cloned Instance stored in CallInfo.
+	-- Avoid compareinstances/GetDebugId walks on every UI/codegen lookup.
+	return Records and Records[Target] or nil
+end
+
+local function GetCandidateOwnerUserId(Candidate: Instance): number?
+	local PlayersService = wax.shared.Players
+	local PlayersList = {}
+	pcall(function()
+		local GetPlayers = PlayersService.GetPlayers
+		PlayersList = GetPlayers(PlayersService)
+	end)
+
+	local Current = Candidate
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" then
+			break
+		end
+
+		if Current.ClassName == "Player" then
+			return ReadUserId(Current)
+		end
+
+		for _, Player in PlayersList do
+			local Character
+			pcall(function()
+				Character = Player.Character
+			end)
+			if Character and IsSameObject(Current, Character) then
+				return ReadUserId(Player)
+			end
+		end
+
+		Current = ReadParent(Current)
+	end
+
+	return nil
+end
+
+local function CandidateMatchesSuffix(Candidate: Instance, Record): boolean
+	local Suffix = Record and Record.Suffix
+	if type(Suffix) ~= "table" or #Suffix == 0 then
+		return true
+	end
+
+	local Current = Candidate
+	for Index = 1, #Suffix do
+		if typeof(Current) ~= "Instance" then
+			return false
+		end
+
+		local Name, ClassName = ReadMetadata(Current)
+		local Expected = Suffix[Index]
+		if Name ~= Expected.Name or ClassName ~= Expected.ClassName then
+			return false
+		end
+
+		Current = ReadParent(Current)
+	end
+
+	return true
+end
+
+local function SquaredDistance(First: Vector3, Second: Vector3): number
+	local X = First.X - Second.X
+	local Y = First.Y - Second.Y
+	local Z = First.Z - Second.Z
+	return X * X + Y * Y + Z * Z
+end
+
+-- Universal exact-reference resolver.
+--
+-- Do not search game-specific containers and do not guess by Name/ClassName.
+-- A same-named Tool or Handle can belong to another player, so heuristic
+-- replacement can silently generate a valid path to the wrong Instance.
+--
+-- Cobalt keeps both the original hook argument and the cloned CallInfo value.
+-- During temporary reparenting, either reference may report Parent later. Only
+-- those exact references (or compareinstances-identical references) are used.
+local function ResolveLiveInstance(Target: Instance, Record): Instance
+	if typeof(Target) ~= "Instance" or Target == game then
+		return Target
+	end
+
+	local function UseIfParented(Candidate)
+		if typeof(Candidate) ~= "Instance" or ReadParent(Candidate) == nil then
+			return nil
+		end
+
+		if Record then
+			Record.Resolved = Candidate
+		end
+		return Candidate
+	end
+
+	-- A previously resolved exact reference is cheapest and authoritative.
+	local Resolved = Record and UseIfParented(Record.Resolved)
+	if Resolved then
+		return Resolved
+	end
+
+	-- The raw hook argument is preferred over Cobalt's cloned reference.
+	Resolved = Record and UseIfParented(Record.Original)
+	if Resolved then
+		return Resolved
+	end
+
+	Resolved = UseIfParented(Target)
+	if Resolved then
+		return Resolved
+	end
+
+	-- No global DataModel scan and no Name/Class fallback. Returning the exact
+	-- nil-parent reference is safer than producing a path to another object.
+	return Target
+end
+
+wax.shared.ResolveSimpleSpyLiveInstance = ResolveLiveInstance
+
+local function IsLocalPlayerObject(Object: Instance): boolean
+	if Object.ClassName ~= "Player" then
+		return false
+	end
+
+	local Success, UserId = pcall(function()
+		return Object.UserId
+	end)
+
+	return Success and UserId == wax.shared.LocalPlayer.UserId
+end
+
+local function IsLocalCharacterObject(Object: Instance): boolean
+	local Parent = ReadParent(Object)
+	if not Parent or Object.ClassName ~= "Model" or not IsLocalPlayerObject(Parent) then
+		return false
+	end
+
+	local Character = wax.shared.LocalPlayer.Character
+	return (Character and IsSameObject(Object, Character)) or Object.Name == wax.shared.LocalPlayer.Name
+end
+
+local function BuildChildAccessor(Current: Instance, Parent: Instance, Name: string, LookupMode: string): string
+	local Fallback = BuildStaticAccessor(Name, LookupMode)
+	local Children = ReadChildren(Parent)
+	if not Children then
+		return Fallback
+	end
+
+	local SameNameCount = 0
+	local AbsoluteIndex = nil
+	for Index, Child in Children do
+		if Child.Name == Name then
+			SameNameCount += 1
+		end
+
+		if IsSameObject(Child, Current) then
+			AbsoluteIndex = Index
+		end
+	end
+
+	-- cloneref can make direct equality unavailable. Only use DebugId when a
+	-- duplicate name actually requires disambiguation; call it as a direct
+	-- function so getnamecallmethod() remains untouched.
+	if SameNameCount > 1 and not AbsoluteIndex then
+		local CurrentDebugId = ReadDebugId(Current)
+		if CurrentDebugId then
+			for Index, Child in Children do
+				if Child.Name == Name and ReadDebugId(Child) == CurrentDebugId then
+					AbsoluteIndex = Index
+					break
+				end
+			end
+		end
+	end
+
+	if SameNameCount > 1 and AbsoluteIndex then
+		return ":GetChildren()[" .. tostring(AbsoluteIndex) .. "]"
+	end
+
+	return Fallback
+end
+
+local function IsValidLuaIdentifier(Name: string): boolean
+	return string.match(Name, "^[%a_][%w_]*$") ~= nil
+end
+
+local function FormatSimpleSpyName(Name: string): string
+	if IsValidLuaIdentifier(Name) then
+		return "." .. Name
+	end
+
+	return "[" .. Quote(Name) .. "]"
+end
+
+local function GetSimpleSpyInstanceReference(Current: Instance): string
+	local Name = Current.Name
+	local Parent = ReadParent(Current)
+	if not Parent then
+		return FormatSimpleSpyName(Name)
+	end
+
+	local Children = ReadChildren(Parent)
+	if not Children then
+		return FormatSimpleSpyName(Name)
+	end
+
+	local SameNameCount = 0
+	local AbsoluteIndex = nil
+	for Index, Child in Children do
+		if Child.Name == Name then
+			SameNameCount += 1
+		end
+
+		if IsSameObject(Child, Current) then
+			AbsoluteIndex = Index
+		end
+	end
+
+	if SameNameCount > 1 and AbsoluteIndex then
+		return ":GetChildren()[" .. tostring(AbsoluteIndex) .. "]"
+	end
+
+	return FormatSimpleSpyName(Name)
+end
+
+local function FindSimpleSpyCharacterAncestor(Target: Instance): Instance?
+	local Current = Target
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" then
+			break
+		end
+
+		if Current.ClassName == "Model" then
+			local Success, Humanoid = pcall(function()
+				local FindFirstChildOfClass = Current.FindFirstChildOfClass
+				return FindFirstChildOfClass(Current, "Humanoid")
+			end)
+
+			if Success and Humanoid then
+				return Current
+			end
+		end
+
+		Current = ReadParent(Current)
+	end
+
+	return nil
+end
+
+local function GetCharacterBase(Character: Instance): string?
+	local LocalPlayer = wax.shared.LocalPlayer
+	local LocalCharacter = LocalPlayer and LocalPlayer.Character
+	if LocalCharacter and IsSameObject(Character, LocalCharacter) then
+		return 'game:GetService("Players").LocalPlayer.Character'
+	end
+
+	local PlayersList = {}
+	pcall(function()
+		local GetPlayers = wax.shared.Players.GetPlayers
+		PlayersList = GetPlayers(wax.shared.Players)
+	end)
+
+	for _, Player in PlayersList do
+		local PlayerCharacter
+		pcall(function()
+			PlayerCharacter = Player.Character
+		end)
+		if PlayerCharacter and IsSameObject(Character, PlayerCharacter) then
+			local PlayerName = Player.Name
+			return 'game:GetService("Players")' .. FormatSimpleSpyName(PlayerName) .. '.Character'
+		end
+	end
+
+	-- NPC humanoid models are not LocalPlayer.Character. Fall back to their
+	-- real Workspace/service path instead of fabricating a player path.
+	return nil
+end
+
+-- Mirrors the uploaded SimpleSpy getFullPath logic:
+--   * humanoid-model ancestry -> LocalPlayer.Character
+--   * service roots -> game:GetService(...)
+--   * invalid identifiers -> ["name"]
+--   * duplicate siblings -> :GetChildren()[absoluteIndex]
+-- Cobalt's GetNil(DebugId) reference is retained for nil-parent roots because a
+-- literal "game.Name" path cannot retrieve a nil-parent Instance.
+local function SimpleSpyGetFullPath(Target: Instance, OriginRecord): (string?, string?)
+	if typeof(Target) ~= "Instance" then
+		return nil, nil
+	end
+
+	Target = ResolveLiveInstance(Target, OriginRecord)
+
+	local Character = FindSimpleSpyCharacterAncestor(Target)
+	local CharacterBase = Character and GetCharacterBase(Character)
+	if Character and CharacterBase then
+		local CharacterParts = {}
+		local Current = Target
+
+		for _ = 1, 256 do
+			if typeof(Current) ~= "Instance" or IsSameObject(Current, Character) or Current == game then
+				break
+			end
+
+			table.insert(CharacterParts, 1, FormatSimpleSpyName(Current.Name))
+			Current = ReadParent(Current)
+		end
+
+		return CharacterBase .. table.concat(CharacterParts), nil
+	end
+
+	local PathParts = {}
+	local Current = Target
+	local Base = nil
+	local Prelude = nil
+
+	for _ = 1, 256 do
+		if typeof(Current) ~= "Instance" or Current == game then
+			break
+		end
+
+		local Parent = ReadParent(Current)
+		local CurrentReference = GetSimpleSpyInstanceReference(Current)
+		if CurrentReference then
+			table.insert(PathParts, 1, CurrentReference)
+		end
+
+		local Success, Service = pcall(function()
+			local GetService = game.GetService
+			return GetService(game, Current.ClassName)
+		end)
+
+		if Success and typeof(Service) == "Instance" and IsSameObject(Service, Current) then
+			Base = 'game:GetService(' .. Quote(Current.ClassName) .. ')'
+			if #PathParts > 0 then
+				table.remove(PathParts, 1)
+			end
+			break
+		end
+
+		if Parent == nil then
+			local DebugId = ReadDebugId(Current)
+			local DebugIdExpression = DebugId and Quote(DebugId) or "nil"
+
+			Base = "GetNil("
+				.. Quote(Current.Name)
+				.. ", "
+				.. Quote(Current.ClassName)
+				.. ", "
+				.. DebugIdExpression
+				.. ")"
+			Prelude = GetNilCode
+
+			-- PathParts already contains the nil-parent root itself. Remove that
+			-- accessor because GetNil(...) resolves the root object directly.
+			if #PathParts > 0 then
+				table.remove(PathParts, 1)
+			end
+			break
+		end
+
+		Current = Parent
+	end
+
+	if not Base then
+		Base = "game"
+	end
+
+	return (Base .. table.concat(PathParts)):gsub("%.%[", "["), Prelude
+end
+
+wax.shared.SimpleSpyGetFullPath = SimpleSpyGetFullPath
+
+-- One universal resolver is shared by generated code and the argument UI.
+-- A parented live path always wins over a stale GetNil snapshot. When a live
+-- path becomes available, update the per-call snapshot in place so every UI
+-- surface and later copy operation observes the same value.
+local function FindInstanceSnapshot(Target: Instance, Snapshots)
+	local InstanceSnapshots = Snapshots and Snapshots.Instances
+	if type(InstanceSnapshots) ~= "table" then
+		return nil
+	end
+
+	local Direct = InstanceSnapshots[Target]
+	if Direct then
+		return Direct
+	end
+
+	for Reference, Snapshot in next, InstanceSnapshots do
+		if typeof(Reference) == "Instance" and IsSameObject(Reference, Target) then
+			return Snapshot
+		end
+	end
+
+	return nil
+end
+
+local function IsParentedPath(Path, Prelude): boolean
+	return type(Path) == "string"
+		and Prelude == nil
+		and not string.match(Path, "^GetNil%(")
+		and not string.match(Path, "^nil%s")
+end
+
+local function ResolveSimpleSpyPath(Target: Instance, Snapshots): (string?, string?)
+	if typeof(Target) ~= "Instance" then
+		return nil, nil
+	end
+
+	local OriginRecord
+	local OriginRecords = Snapshots and Snapshots.OriginRecords
+	if type(OriginRecords) == "table" then
+		OriginRecord = OriginRecords[Target]
+	end
+
+	local LivePath, LivePrelude = SimpleSpyGetFullPath(Target, OriginRecord)
+	local Snapshot = FindInstanceSnapshot(Target, Snapshots)
+
+	-- Current parent information is authoritative. Replace stale GetNil data.
+	if IsParentedPath(LivePath, LivePrelude) then
+		if Snapshot then
+			Snapshot.Code = LivePath
+			Snapshot.Prelude = nil
+		end
+		return LivePath, nil
+	end
+
+	-- A previously captured parented path is safer than a transient nil-parent
+	-- result from a cloned reference.
+	if Snapshot and IsParentedPath(Snapshot.Code, Snapshot.Prelude) then
+		return Snapshot.Code, nil
+	end
+
+	if type(LivePath) == "string" then
+		return LivePath, LivePrelude
+	end
+
+	if Snapshot and type(Snapshot.Code) == "string" then
+		return Snapshot.Code, Snapshot.Prelude
+	end
+
+	return nil, nil
+end
+
+wax.shared.ResolveSimpleSpyPath = ResolveSimpleSpyPath
+
+local function BuildInstanceSnapshot(Target: Instance, VariableName: string?, OriginRecord)
+	local Code, Prelude = SimpleSpyGetFullPath(Target, OriginRecord)
+	if type(Code) ~= "string" then
+		return nil
+	end
+
+	if VariableName then
+		Code = "local " .. VariableName .. " = " .. Code
+	end
+
+	return {
+		Code = Code,
+		Prelude = Prelude,
+	}
+end
+
+local function CaptureInstancePaths(Value, InstanceSnapshots, VisitedTables, OriginRecords)
+	if typeof(Value) == "Instance" then
+		if InstanceSnapshots[Value] == nil then
+			InstanceSnapshots[Value] = BuildInstanceSnapshot(Value, nil, GetOriginRecord(OriginRecords, Value))
+		end
+		return
+	end
+
+	if type(Value) ~= "table" or VisitedTables[Value] then
+		return
+	end
+
+	VisitedTables[Value] = true
+	for Key, ChildValue in next, Value do
+		CaptureInstancePaths(Key, InstanceSnapshots, VisitedTables, OriginRecords)
+		CaptureInstancePaths(ChildValue, InstanceSnapshots, VisitedTables, OriginRecords)
+	end
+end
+
+local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
+	local Cache = wax.shared.CallPathSnapshots
+	local CacheKey = CallInfo.Arguments or CallInfo
+	local OriginRecords = GetOriginRecords(CallInfo)
+
+	-- One finalized snapshot is shared by the argument UI and copied code.
+	-- This prevents either surface from independently resolving a different
+	-- same-named Instance after the call.
+	local Snapshots = {
+		Event = BuildInstanceSnapshot(RemoteInstance, "Event"),
+		Instances = {},
+		OriginRecords = OriginRecords,
+	}
+
+	Cache[CacheKey] = Snapshots
+	Cache[CallInfo] = Snapshots
+	if CallInfo.InvokeResult then
+		Cache[CallInfo.InvokeResult] = Snapshots
+	end
+
+	local VisitedTables = {}
+	CaptureInstancePaths(CallInfo.Arguments, Snapshots.Instances, VisitedTables, OriginRecords)
+	CaptureInstancePaths(CallInfo.InvokeResult, Snapshots.Instances, VisitedTables, OriginRecords)
+end
+
+local function HasUnresolvedInstancePath(Value, VisitedTables, OriginRecords): boolean
+	if typeof(Value) == "Instance" then
+		local Path, Prelude = SimpleSpyGetFullPath(Value, GetOriginRecord(OriginRecords, Value))
+		return type(Path) ~= "string" or Prelude ~= nil
+	end
+
+	if type(Value) ~= "table" or VisitedTables[Value] then
+		return false
+	end
+
+	VisitedTables[Value] = true
+	for Key, ChildValue in next, Value do
+		if HasUnresolvedInstancePath(Key, VisitedTables, OriginRecords) or HasUnresolvedInstancePath(ChildValue, VisitedTables, OriginRecords) then
+			return true
+		end
+	end
+
+	return false
+end
+
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
+
+
+local function GetSimpleSpyCompatConfig()
+	local Environment = getgenv()
+	local Config = Environment.CobaltSimpleSpyConfig
+
+	if type(Config) ~= "table" then
+		Config = {}
+		Environment.CobaltSimpleSpyConfig = Config
+	end
+
+	if Config.Enabled == nil then Config.Enabled = true end
+	if Config.LogCheckCaller == nil then Config.LogCheckCaller = false end
+	if Config.AutoBlock == nil then Config.AutoBlock = false end
+	if Config.BlockAllRemotes == nil then Config.BlockAllRemotes = false end
+	if type(Config.Blacklist) ~= "table" then Config.Blacklist = {} end
+	if type(Config.Blocklist) ~= "table" then Config.Blocklist = {} end
+	if type(Config.PathCaptureBudget) ~= "number" then Config.PathCaptureBudget = 64 end
+	if type(Config.PathResolveFrames) ~= "number" then Config.PathResolveFrames = 18 end
+	if type(Config.UIPathResolveFrames) ~= "number" then Config.UIPathResolveFrames = 120 end
+
+	return Config
+end
+
+local function GetRemoteDebugId(Remote)
+	if typeof(Remote) ~= "Instance" then
+		return nil
+	end
+
+	local Success, Result = pcall(function()
+		local GetDebugId = Remote.GetDebugId
+		return GetDebugId(Remote)
+	end)
+
+	return Success and type(Result) == "string" and Result or nil
+end
+
+local function SimpleSpyFilterMatches(FilterTable, Remote, DebugId)
+	if type(FilterTable) ~= "table" or typeof(Remote) ~= "Instance" then
+		return false
+	end
+
+	if FilterTable[Remote] or FilterTable[Remote.Name] or (DebugId and FilterTable[DebugId]) then
+		return true
+	end
+
+	for _, Entry in next, FilterTable do
+		if
+			rawequal(Entry, Remote)
+			or Entry == Remote
+			or Entry == Remote.Name
+			or (DebugId and Entry == DebugId)
+		then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function ResolveSimpleSpyFilterDecision(LogObject, Info)
+	local Config = GetSimpleSpyCompatConfig()
+	if not Config.Enabled then
+		return {
+			Ignore = false,
+			Block = false,
+			CompatibilityBlock = false,
+		}
+	end
+
+	local Remote = LogObject.Instance
+	local DebugId = GetRemoteDebugId(Remote)
+
+	return {
+		Ignore = SimpleSpyFilterMatches(Config.Blacklist, Remote, DebugId),
+		Block = Config.BlockAllRemotes == true or SimpleSpyFilterMatches(Config.Blocklist, Remote, DebugId),
+		CompatibilityBlock = Config.BlockAllRemotes == true or SimpleSpyFilterMatches(Config.Blocklist, Remote, DebugId),
+	}
+end
+
+local function IsSimpleSpySpam(LogObject)
+	local Config = GetSimpleSpyCompatConfig()
+	if not Config.Enabled or not Config.AutoBlock then
+		return false
+	end
+
+	local Now = tick()
+	LogObject.SimpleSpyLastCall = LogObject.SimpleSpyLastCall or 0
+	LogObject.SimpleSpyBadOccurrences = LogObject.SimpleSpyBadOccurrences or 0
+
+	if LogObject.SimpleSpyAutoExcluded then
+		return true
+	end
+
+	if Now - LogObject.SimpleSpyLastCall < 1 then
+		LogObject.SimpleSpyBadOccurrences += 1
+		LogObject.SimpleSpyLastCall = Now
+
+		if LogObject.SimpleSpyBadOccurrences > 3 then
+			LogObject.SimpleSpyAutoExcluded = true
+		end
+
+		return true
+	end
+
+	LogObject.SimpleSpyLastCall = Now
+	LogObject.SimpleSpyBadOccurrences = 0
+	return false
+end
 
 --// Log Call Queue \\--
 wax.shared.LogNotificationQueue = {
@@ -9694,6 +11279,77 @@ local function QueueNotification(LogObject, CallIndex: number)
 	}
 end
 
+
+-- One shared queue retries only exact raw/cloned references. No game-specific
+-- folders, global descendant scans, or Name/Class replacement are used.
+local PathCaptureQueue = {
+	Items = {},
+	Head = 1,
+	Tail = 0,
+}
+
+local function QueuePathCapture(LogObject, CallIndex: number, CallInfo, RemoteInstance: Instance)
+	PathCaptureQueue.Tail += 1
+	PathCaptureQueue.Items[PathCaptureQueue.Tail] = {
+		Log = LogObject,
+		Index = CallIndex,
+		Info = CallInfo,
+		Remote = RemoteInstance,
+		Attempts = 0,
+	}
+end
+
+local function RequeuePathCapture(Item)
+	PathCaptureQueue.Tail += 1
+	PathCaptureQueue.Items[PathCaptureQueue.Tail] = Item
+end
+
+local function ProcessPathCaptureQueue()
+	local Config = GetSimpleSpyCompatConfig()
+	local Budget = tonumber(Config.PathCaptureBudget) or 64
+	Budget = math.clamp(math.floor(Budget), 1, 256)
+
+	-- Temporary Parent=nil transitions normally settle within a few frames.
+	-- The shared queue retries exact references only; it never scans the game.
+	local ResolveFrames = tonumber(Config.PathResolveFrames) or 18
+	ResolveFrames = math.clamp(math.floor(ResolveFrames), 0, 120)
+
+	local Processed = 0
+	local TailAtFrameStart = PathCaptureQueue.Tail
+	while PathCaptureQueue.Head <= TailAtFrameStart and Processed < Budget do
+		local Item = PathCaptureQueue.Items[PathCaptureQueue.Head]
+		PathCaptureQueue.Items[PathCaptureQueue.Head] = nil
+		PathCaptureQueue.Head += 1
+		Processed += 1
+
+		if Item and Item.Log.Calls[Item.Index] == Item.Info then
+			local OriginRecords = GetOriginRecords(Item.Info)
+			local Unresolved = false
+			local Success, Result = pcall(function()
+				return HasUnresolvedInstancePath(Item.Info.Arguments, {}, OriginRecords)
+					or HasUnresolvedInstancePath(Item.Info.InvokeResult, {}, OriginRecords)
+			end)
+			if Success then
+				Unresolved = Result == true
+			end
+
+			if Unresolved and Item.Attempts < ResolveFrames then
+				Item.Attempts += 1
+				RequeuePathCapture(Item)
+			else
+				pcall(CaptureCallPaths, Item.Info, Item.Remote)
+				QueueNotification(Item.Log, Item.Index)
+			end
+		end
+	end
+
+	if PathCaptureQueue.Head > PathCaptureQueue.Tail then
+		table.clear(PathCaptureQueue.Items)
+		PathCaptureQueue.Head = 1
+		PathCaptureQueue.Tail = 0
+	end
+end
+
 --// Auto Ignore Constants \\--
 local SpamCallCountThreshold = 15
 local SpamTimeWindowSeconds = 1
@@ -9701,6 +11357,8 @@ local AutoIgnoreSpammyEvents = false
 
 if not wax.shared.IS_ACTOR then
 	wax.shared.Connect(wax.shared.RunService.Heartbeat:Connect(function()
+		ProcessPathCaptureQueue()
+
 		local Queue = wax.shared.LogNotificationQueue
 		local Tail = Queue.Tail
 
@@ -9867,7 +11525,7 @@ do
 end
 
 --// Cloning \\--
-function DeepClone(OriginalValue, ValueCopies)
+function DeepClone(OriginalValue, ValueCopies, CloneContext)
 	if wax.shared.IS_ACTOR then
 		return OriginalValue
 	end
@@ -9880,7 +11538,14 @@ function DeepClone(OriginalValue, ValueCopies)
 
 		local RobloxType = typeof(OriginalValue)
 		if RobloxType == "Instance" then
-			return cloneref(OriginalValue)
+			local Cloned = cloneref(OriginalValue)
+			if CloneContext and CloneContext.Records then
+				local Record = CaptureOriginRecord(OriginalValue, CloneContext.PositionHint)
+				if Record then
+					CloneContext.Records[Cloned] = Record
+				end
+			end
+			return Cloned
 	
 		elseif RobloxType == "userdata" then
 			if getmetatable(OriginalValue) then
@@ -9918,13 +11583,20 @@ function DeepClone(OriginalValue, ValueCopies)
 		local ValueType = type(Value)
 
 		if ValueType == "table" then
-			ShallowCopy[Key] = DeepClone(Value, ValueCopies)
+			ShallowCopy[Key] = DeepClone(Value, ValueCopies, CloneContext)
 
 		elseif ValueType == "userdata" then
 			local ValueRobloxType = typeof(Value)
 
 			if ValueRobloxType == "Instance" then
-				ShallowCopy[Key] = cloneref(Value)
+				local Cloned = cloneref(Value)
+				ShallowCopy[Key] = Cloned
+				if CloneContext and CloneContext.Records then
+					local Record = CaptureOriginRecord(Value, CloneContext.PositionHint)
+					if Record then
+						CloneContext.Records[Cloned] = Record
+					end
+				end
 
 			elseif ValueRobloxType == "userdata" then
 				if getmetatable(Value) then
@@ -10025,7 +11697,13 @@ function Log:ShouldBlock(RawInfo): boolean
 		FilterAction = CallFilters:Resolve(self.Instance, self.Type, RawInfo)
 	end
 
-	local ShouldBlock = RawInfo.Blocked == true or self.Blocked or FilterAction == "Block"
+	local SimpleSpyDecision = ResolveSimpleSpyFilterDecision(self, RawInfo)
+	local ShouldBlock =
+		RawInfo.Blocked == true
+		or self.Blocked
+		or FilterAction == "Block"
+		or SimpleSpyDecision.Block
+
 	if ShouldBlock then
 		RawInfo.Blocked = true
 	end
@@ -10033,6 +11711,8 @@ function Log:ShouldBlock(RawInfo): boolean
 	PendingCallDecisions[RawInfo] = {
 		FilterAction = FilterAction,
 		ShouldBlock = ShouldBlock,
+		SimpleSpyIgnore = SimpleSpyDecision.Ignore,
+		SimpleSpyCompatibilityBlock = SimpleSpyDecision.CompatibilityBlock,
 	}
 	return ShouldBlock
 end
@@ -10042,8 +11722,26 @@ function Log:Call(RawInfo): number?
 	local Decision = PendingCallDecisions[RawInfo]
 	PendingCallDecisions[RawInfo] = nil
 
+	local SimpleSpyConfig = GetSimpleSpyCompatConfig()
+	if
+		SimpleSpyConfig.Enabled
+		and RawInfo.IsExecutor == true
+		and not SimpleSpyConfig.LogCheckCaller
+	then
+		return nil
+	end
+
+	if Decision.SimpleSpyIgnore then
+		return nil
+	end
+
+	if not wax.shared.IS_ACTOR and IsSimpleSpySpam(self) then
+		return nil
+	end
+
 	local ShouldCapture = if ShouldBlock
-		then wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
+		then Decision.SimpleSpyCompatibilityBlock
+			or wax.shared.SaveManager:GetState("LogBlockedRemotes", false)
 		else not self.Ignored and Decision.FilterAction ~= "Ignore"
 
 	if not ShouldCapture then
@@ -10059,8 +11757,27 @@ function Log:Call(RawInfo): number?
 	end
 
 	--// Info stuff \\--
-	local Info = DeepClone(RawInfo)
+	local CloneContext = {
+		Records = setmetatable({}, { __mode = "k" }),
+		PositionHint = FindPositionHint(RawInfo.Arguments, {}),
+	}
+	local Info = DeepClone(RawInfo, nil, CloneContext)
 	Info.CreationTime = tick()
+
+	local OriginCache = wax.shared.CallOriginRecords
+	OriginCache[Info] = CloneContext.Records
+	if Info.Arguments then
+		OriginCache[Info.Arguments] = CloneContext.Records
+	end
+	if Info.InvokeResult then
+		OriginCache[Info.InvokeResult] = CloneContext.Records
+	end
+
+	-- Path generation is intentionally deferred until after the intercepted
+	-- caller resumes. Tool-drop scripts commonly call FireServer while the Tool
+	-- is still parented, then set Parent = nil immediately after the call. This
+	-- matches SimpleSpy's scheduled logging behavior and avoids executing any
+	-- Instance traversal inside the active remote hook.
 
 	--// Actor Relaying \\--
 	if wax.shared.IS_ACTOR then
@@ -10136,7 +11853,10 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	QueueNotification(self, Index)
+	-- Defer all Instance traversal to one bounded shared Heartbeat queue.
+	-- This keeps the remote hook fast and prevents hundreds of polling tasks.
+	QueuePathCapture(self, Index, Info, self.Instance)
+
 	return Index
 end
 
@@ -18061,7 +19781,18 @@ return function(props: {
 		ArgumentList.Clear(OriginalArgsInfoFrame)
 
 		--// Populate Arguments \\--
-		ArgumentList.Populate(ArgumentsInfoFrame, CallInfo[InitialDataView])
+		-- Use the same finalized per-call snapshots as Copy Calling Code.
+		local PathCache = wax.shared.CallPathSnapshots
+		local PathSnapshots = PathCache and (
+			PathCache[CallInfo]
+			or (CallInfo.Arguments and PathCache[CallInfo.Arguments])
+			or (CallInfo.InvokeResult and PathCache[CallInfo.InvokeResult])
+		)
+		local ArgumentOptions = {
+			PathSnapshots = PathSnapshots,
+		}
+
+		ArgumentList.Populate(ArgumentsInfoFrame, CallInfo[InitialDataView], ArgumentOptions)
 
 		local ShouldShowOriginalArgs = (
 			InitialDataView == "InvokeResult" and wax.shared.GetTableLength(CallInfo.Arguments) > 0
@@ -18069,7 +19800,7 @@ return function(props: {
 
 		Modal.Tabs:SetMounted("Args", ShouldShowOriginalArgs)
 		if ShouldShowOriginalArgs then
-			ArgumentList.Populate(OriginalArgsInfoFrame, CallInfo.Arguments)
+			ArgumentList.Populate(OriginalArgsInfoFrame, CallInfo.Arguments, ArgumentOptions)
 		end
 
 		--// Plugin Hooks \\--
@@ -18111,6 +19842,7 @@ type HolderOptions = {
 	Label: string?,
 	MaxPreviewLength: number?,
 	PreviewCache: { [number]: string }?,
+	PathSnapshots: any?,
 }
 
 local function TruncatePreviewText(Text: string, MaxLength: number): string
@@ -18122,14 +19854,14 @@ local function TruncatePreviewText(Text: string, MaxLength: number): string
 	return NormalizedText:sub(1, MaxLength) .. "..."
 end
 
-function ArgumentList.CreatePreviewText(Value: any, MaxLength: number?): string
+function ArgumentList.CreatePreviewText(Value: any, MaxLength: number?, PathSnapshots): string
 	MaxLength = MaxLength or DefaultPreviewMaxLength
 
 	if typeof(Value) == "string" then
 		return `"{TruncatePreviewText(Value, MaxLength)}"`
 	end
 
-	return TruncatePreviewText(tostring(LazySerializer.QuickSerializeArgument(Value)), MaxLength)
+	return TruncatePreviewText(tostring(LazySerializer.QuickSerializeArgument(Value, PathSnapshots)), MaxLength)
 end
 
 function ArgumentList.Clear(Frame: GuiObject)
@@ -18203,15 +19935,15 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	if IsPreview then
 		if PreviewCache then
 			if not PreviewCache[Index] then
-				PreviewCache[Index] = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength)
+				PreviewCache[Index] = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
 			end
 
 			Text = PreviewCache[Index]
 		else
-			Text = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength)
+			Text = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
 		end
 	else
-		Text = tostring(LazySerializer.QuickSerializeArgument(Value)):gsub("<", "&lt;"):gsub(">", "&gt;")
+		Text = tostring(LazySerializer.QuickSerializeArgument(Value, Options.PathSnapshots)):gsub("<", "&lt;"):gsub(">", "&gt;")
 	end
 
 	local TextLabel = Interface.New("TextLabel", {
@@ -18230,6 +19962,52 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 		Parent = Holder,
 	})
 
+
+	-- Temporary nil-parent transitions are common for Tool/Handle remotes.
+	-- Refresh only the currently visible Instance row until the exact original
+	-- reference acquires a parent. This is universal and does not search any
+	-- game-specific folder or call game:GetDescendants().
+	if typeof(Value) == "Instance" then
+		task.spawn(function()
+			local Config = getgenv().CobaltSimpleSpyConfig
+			local MaxFrames = 120
+			if type(Config) == "table" and type(Config.UIPathResolveFrames) == "number" then
+				MaxFrames = math.max(1, math.floor(Config.UIPathResolveFrames))
+			end
+
+			for _ = 1, MaxFrames do
+				if not Holder.Parent or not TextLabel.Parent then
+					return
+				end
+
+				local UpdatedText
+				if IsPreview then
+					UpdatedText = ArgumentList.CreatePreviewText(Value, Options.MaxPreviewLength, Options.PathSnapshots)
+				else
+					UpdatedText = tostring(LazySerializer.QuickSerializeArgument(Value, Options.PathSnapshots))
+						:gsub("<", "&lt;")
+						:gsub(">", "&gt;")
+				end
+
+				if UpdatedText ~= TextLabel.Text then
+					TextLabel.Text = UpdatedText
+					if PreviewCache then
+						PreviewCache[Index] = UpdatedText
+					end
+				end
+
+				-- Stop as soon as a normal parented path is displayed.
+				if not string.find(UpdatedText, "GetNil%(")
+					and not string.find(UpdatedText, "Nil Parent")
+				then
+					return
+				end
+
+				wax.shared.RunService.Heartbeat:Wait()
+			end
+		end)
+	end
+
 	if not IsPreview then
 		local _, TextY = TextBounds.Get(TextLabel.Text, TextLabel.FontFace, TextLabel.TextSize, TextLabel.AbsoluteSize.X)
 		Holder.Size = UDim2.new(1, 0, 0, TextY + 12)
@@ -18238,7 +20016,7 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	return Holder
 end
 
-function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?)
+function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?, Options: HolderOptions?)
 	if not Values then
 		return
 	end
@@ -18248,7 +20026,7 @@ function ArgumentList.Populate(Frame: GuiObject, Values: { [any]: any }?)
 			task.wait()
 		end
 
-		ArgumentList.CreateHolder(Index, Values[Index], Frame)
+		ArgumentList.CreateHolder(Index, Values[Index], Frame, Options)
 	end
 end
 
@@ -21576,7 +23354,28 @@ function LazySerializer.QuickSerializeNumber(Number: number)
 	return Number
 end
 
-function LazySerializer.QuickSerializeArgument(Argument)
+local function ResolveSnapshotPath(Argument: Instance, PathSnapshots)
+	local InstanceSnapshots = PathSnapshots and PathSnapshots.Instances
+	if not InstanceSnapshots then
+		return nil
+	end
+
+	local Direct = InstanceSnapshots[Argument]
+	if Direct and type(Direct.Code) == "string" then
+		return Direct.Code
+	end
+
+	for Reference, Snapshot in next, InstanceSnapshots do
+		local Success, Matches = pcall(InstanceSerializer.IsEqualToInstance, Reference, Argument)
+		if Success and Matches and type(Snapshot.Code) == "string" then
+			return Snapshot.Code
+		end
+	end
+
+	return nil
+end
+
+function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 	if typeof(Argument) == "string" then
 		return string.format('"%s"', (Argument :: string))
 	elseif typeof(Argument) == "number" then
@@ -21603,6 +23402,19 @@ function LazySerializer.QuickSerializeArgument(Argument)
 	elseif typeof(Argument) == "table" then
 		return "{...}"
 	elseif typeof(Argument) == "Instance" then
+		local SharedResolver = wax.shared.ResolveSimpleSpyPath
+		if type(SharedResolver) == "function" then
+			local Success, Path = pcall(SharedResolver, Argument, PathSnapshots)
+			if Success and type(Path) == "string" then
+				return Path
+			end
+		end
+
+		local SnapshotPath = ResolveSnapshotPath(Argument, PathSnapshots)
+		if SnapshotPath then
+			return SnapshotPath
+		end
+
 		return InstanceSerializer.Serialize(Argument, { DisableNilParentHandler = true })
 	elseif typeof(Argument) == "userdata" then
 		return "newproxy(" .. (getmetatable(Argument) and "true" or "false") .. ")"
@@ -22325,6 +24137,18 @@ return function(props: {
 		local CallInfoValueCount = wax.shared.GetTableLength(CallInfoValues)
 		local HasError = CallInfo.Error ~= nil
 
+		-- Use the exact same per-call SimpleSpy path state as Copy Calling Code.
+		-- The main call-card preview previously omitted PathSnapshots entirely, so
+		-- cloned Instance arguments stayed on GetNil(...) even after the retained
+		-- raw reference acquired its new parent. This lookup is universal and does
+		-- not scan or hardcode any game hierarchy.
+		local PathCache = wax.shared.CallPathSnapshots
+		local PathSnapshots = PathCache and (
+			PathCache[CallInfo]
+			or (CallInfo.Arguments and PathCache[CallInfo.Arguments])
+			or (CallInfo.InvokeResult and PathCache[CallInfo.InvokeResult])
+		)
+
 		local function ReleaseIfStale()
 			if RenderGeneration and RenderGeneration ~= self.CurrentCallFrameRenderGeneration then
 				self:ReleaseCallFrame(CallFrame)
@@ -22382,6 +24206,7 @@ return function(props: {
 					IsPreview = true,
 					MaxPreviewLength = MaxArgumentPreviewLength,
 					PreviewCache = CallInfo.PreviewCache,
+					PathSnapshots = PathSnapshots,
 				})
 			end
 		end

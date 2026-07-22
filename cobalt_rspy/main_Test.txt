@@ -7232,13 +7232,7 @@ HookTemplates.Outgoing = HookTemplates.OutgoingRemoteCall
 return HookTemplates
 
 end)() end,
-    [42] = function()local wax,script,require=ImportGlobals(42)local ImportGlobals return (function(...)local GetNilCode = [[local function GetNil(Name, DebugId)
-	for _, Object in getnilinstances() do
-		if Object.Name == Name and Object:GetDebugId() == DebugId then
-			return Object
-		end
-	end
-end]]
+    [42] = function()local wax,script,require=ImportGlobals(42)local ImportGlobals return (function(...)local GetNilCode = [[local function GetNil(Name, DebugId) for _, Object in getnilinstances() do local Success, ObjectDebugId = pcall(Object.GetDebugId, Object); if Object.Name == Name and Success and ObjectDebugId == DebugId then return Object end end end]]
 
 local GetEventReferenceCode = [[local function GetEventReference(options)
 	local Hash, Index, ExcludeExecutor, Path = options.Hash, options.Index, options.ExcludeExecutor, options.Path
@@ -10318,24 +10312,9 @@ end)() end,
     [93] = function()local wax,script,require=ImportGlobals(93)local ImportGlobals return (function(...)local Log = {}
 Log.__index = Log
 
--- Cobalt SimpleSpy compatibility v14: universal call-card UI/path synchronization.
+-- Cobalt SimpleSpy compatibility v15: universal call-card UI/path synchronization.
 
-local GetNilCode = [[local function GetNil(Name, ClassName, DebugId)
-	for _, Object in getnilinstances() do
-		if Object.Name ~= Name or Object.ClassName ~= ClassName then
-			continue
-		end
-
-		if DebugId == nil then
-			return Object
-		end
-
-		local Success, ObjectDebugId = pcall(Object.GetDebugId, Object)
-		if Success and ObjectDebugId == DebugId then
-			return Object
-		end
-	end
-end]]
+local GetNilCode = [[local function GetNil(Name, ClassName, DebugId) for _, Object in getnilinstances() do if Object.Name == Name and Object.ClassName == ClassName then if DebugId == nil then return Object end; local Success, ObjectDebugId = pcall(Object.GetDebugId, Object); if Success and ObjectDebugId == DebugId then return Object end end end end]]
 
 -- Call-time paths must be captured without invoking Instance methods through
 -- ':' syntax. A nested engine namecall inside the active __namecall hook can
@@ -23719,6 +23698,8 @@ return function(props: {
 		CallFramePool = {},
 		CallFrameData = setmetatable({}, { __mode = "k" }),
 		CurrentCallFrameRenderGeneration = 0,
+		NewestRefreshQueued = false,
+		PendingNewestRefreshLog = nil,
 	}
 
 	--// UI \\--
@@ -23788,8 +23769,12 @@ return function(props: {
 		return if IsShowingExecutorLogs() then #Log.Calls else #Log.GameCalls
 	end
 
+	-- Display calls newest-first while preserving the underlying chronological
+	-- storage order used by logging, replay, filtering, and saved sessions.
 	local function GetCallByVisibleIndex(Log, VisibleIndex: number)
-		local CallIndex = if IsShowingExecutorLogs() then VisibleIndex else Log.GameCalls[VisibleIndex]
+		local VisibleCount = GetVisibleCallCount(Log)
+		local ReverseIndex = VisibleCount - VisibleIndex + 1
+		local CallIndex = if IsShowingExecutorLogs() then ReverseIndex else Log.GameCalls[ReverseIndex]
 		if not CallIndex then
 			return nil, nil
 		end
@@ -23799,10 +23784,37 @@ return function(props: {
 
 	local function GetVisibleIndexForCall(Log, CallIndex: number): number?
 		if IsShowingExecutorLogs() then
-			return CallIndex
+			if not Log.Calls[CallIndex] then
+				return nil
+			end
+
+			return #Log.Calls - CallIndex + 1
 		end
 
-		return table.find(Log.GameCalls, CallIndex)
+		local ChronologicalIndex = table.find(Log.GameCalls, CallIndex)
+		if not ChronologicalIndex then
+			return nil
+		end
+
+		return #Log.GameCalls - ChronologicalIndex + 1
+	end
+
+	function Calls:QueueNewestRefresh(Log)
+		self.PendingNewestRefreshLog = Log
+		if self.NewestRefreshQueued then
+			return
+		end
+
+		self.NewestRefreshQueued = true
+		task.delay(0.1, function()
+			self.NewestRefreshQueued = false
+			local PendingLog = self.PendingNewestRefreshLog
+			self.PendingNewestRefreshLog = nil
+
+			if PendingLog and LogsPage.State.CurrentLog == PendingLog then
+				self:ShowLog(PendingLog)
+			end
+		end)
 	end
 
 	local function GetPreviewCache(CallInfo)
@@ -24552,29 +24564,12 @@ return function(props: {
 		local Page = LogsPage.State.SelectedPageByLog[Log] or 1
 		LogsPage.State.SelectedPageByLog[Log] = Page
 		PaginationManager:Update(GetVisibleCallCount(Log))
+		self:ShowPagination(Log)
 
-		local Start, End = PaginationManager:GetIndexRanges(Page)
-		if VisibleIndex < Start or VisibleIndex > End then
-			self:ShowPagination(Log)
-			return
-		end
-
-		local Call = Log.Calls[CallIndex]
-		if not Call then
-			return
-		end
-
-		local Data = setmetatable({
-			Instance = Log.Instance,
-			Type = Log.Type,
-			Order = VisibleIndex,
-			RenderGeneration = self.CurrentCallFrameRenderGeneration,
-			PreviewCache = GetPreviewCache(Call),
-		}, {
-			__index = Call,
-		})
-
-		CreateCallFrameLimiter:QueueOperation(Data)
+		-- A newly appended call becomes visible index 1. Re-render the current
+		-- page through one debounced refresh so the newest packet appears at
+		-- the top without creating one expensive rebuild per packet.
+		self:QueueNewestRefresh(Log)
 	end
 
 	return Calls
