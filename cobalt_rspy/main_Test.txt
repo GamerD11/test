@@ -14757,12 +14757,19 @@ local ScreenGui = Interface.New("ScreenGui", {
 })
 wax.shared.ScreenGui = ScreenGui
 
+local CurrentCamera = workspace.CurrentCamera
+local ViewportSize = CurrentCamera and CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+local InitialWindowSize = Vector2.new(
+	math.clamp(math.floor(ViewportSize.X * 0.56), 760, 1050),
+	math.clamp(math.floor(ViewportSize.Y * 0.58), 500, 620)
+)
+
 local MainFrame = Interface.New("Frame", {
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	BackgroundColor3 = Color3.fromRGB(15, 15, 15),
 	Position = UDim2.fromScale(0.5, 0.5),
-	-- Start large and scale with the current viewport while keeping Cobalt resizable.
-	Size = UDim2.fromScale(0.82, 0.78),
+	-- Responsive medium-size window; still fully resizable by the user.
+	Size = UDim2.fromOffset(InitialWindowSize.X, InitialWindowSize.Y),
 	ZIndex = 0,
 
 	Constants.MainUICorner,
