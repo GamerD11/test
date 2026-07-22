@@ -4370,6 +4370,14 @@ local function BuildSimpleSpyCallCode(CallInfo, Scenario)
 	end
 
 	local function GetInstancePath(Target)
+		local LiveResolver = wax.shared.ResolveSimpleSpyLiveInstance
+		if type(LiveResolver) == "function" then
+			local Success, LiveTarget = pcall(LiveResolver, Target)
+			if Success and typeof(LiveTarget) == "Instance" then
+				Target = LiveTarget
+			end
+		end
+
 		-- Resolve through SimpleSpy's live getFullPath logic first. This keeps
 		-- copied calling code synchronized with the argument UI when a Tool or
 		-- one of its descendants is reparented after the remote was logged.
@@ -10342,15 +10350,146 @@ local function ReadChildren(Parent: Instance): { Instance }?
 	return Success and type(Result) == "table" and Result or nil
 end
 
+local function ReadParent(Object: Instance): Instance?
+	local Success, Parent = pcall(function()
+		return Object.Parent
+	end)
+
+	if not Success then
+		return nil
+	end
+
+	return typeof(Parent) == "Instance" and Parent or nil
+end
+
 local function IsSameObject(First: Instance, Second: Instance): boolean
 	if rawequal(First, Second) or First == Second then
 		return true
+	end
+
+	if type(compareinstances) == "function" then
+		local Success, Matches = pcall(compareinstances, First, Second)
+		if Success and Matches == true then
+			return true
+		end
 	end
 
 	local FirstDebugId = ReadDebugId(First)
 	local SecondDebugId = ReadDebugId(Second)
 	return FirstDebugId ~= nil and FirstDebugId == SecondDebugId
 end
+
+local function IsDescendantOrSelf(Object: Instance, Ancestor: Instance): boolean
+	if IsSameObject(Object, Ancestor) then
+		return true
+	end
+
+	local Success, Result = pcall(function()
+		local IsDescendantOf = Object.IsDescendantOf
+		return IsDescendantOf(Object, Ancestor)
+	end)
+
+	return Success and Result == true
+end
+
+-- A cloned/stale executor reference can report Parent == nil even though the
+-- corresponding engine Instance has already been reparented. Resolve that
+-- reference against the current DataModel before generating GetNil(...).
+local LiveInstanceResolutionCache = setmetatable({}, { __mode = "k" })
+local FailedResolutionTimes = setmetatable({}, { __mode = "k" })
+
+local function ResolveLiveInstance(Target: Instance): Instance
+	if typeof(Target) ~= "Instance" or Target == game then
+		return Target
+	end
+
+	if ReadParent(Target) ~= nil then
+		return Target
+	end
+
+	local Cached = LiveInstanceResolutionCache[Target]
+	if typeof(Cached) == "Instance" and ReadParent(Cached) ~= nil then
+		return Cached
+	end
+
+	local Now = os.clock()
+	local LastFailure = FailedResolutionTimes[Target]
+	if type(LastFailure) == "number" and Now - LastFailure < 0.05 then
+		return Target
+	end
+
+	local Name
+	local ClassName
+	local MetadataSuccess = pcall(function()
+		Name = Target.Name
+		ClassName = Target.ClassName
+	end)
+	if not MetadataSuccess or type(Name) ~= "string" or type(ClassName) ~= "string" then
+		FailedResolutionTimes[Target] = Now
+		return Target
+	end
+
+	local DescendantsSuccess, Descendants = pcall(function()
+		local GetDescendants = game.GetDescendants
+		return GetDescendants(game)
+	end)
+	if not DescendantsSuccess or type(Descendants) ~= "table" then
+		FailedResolutionTimes[Target] = Now
+		return Target
+	end
+
+	local NameClassMatches = {}
+	for _, Candidate in Descendants do
+		if Candidate.Name ~= Name or Candidate.ClassName ~= ClassName then
+			continue
+		end
+
+		if IsSameObject(Candidate, Target) then
+			LiveInstanceResolutionCache[Target] = Candidate
+			return Candidate
+		end
+
+		table.insert(NameClassMatches, Candidate)
+	end
+
+	-- If Roblox replaced the transient client object with one replicated by the
+	-- server, exact identity no longer exists. Only use a name/class fallback
+	-- when it is unambiguous, preventing an arbitrary same-named object path.
+	if #NameClassMatches == 1 then
+		LiveInstanceResolutionCache[Target] = NameClassMatches[1]
+		return NameClassMatches[1]
+	end
+
+	if #NameClassMatches > 1 then
+		local Preferred = {}
+		local Character = wax.shared.LocalPlayer.Character
+		local Backpack
+		pcall(function()
+			local FindFirstChildOfClass = wax.shared.LocalPlayer.FindFirstChildOfClass
+			Backpack = FindFirstChildOfClass(wax.shared.LocalPlayer, "Backpack")
+		end)
+
+		for _, Candidate in NameClassMatches do
+			if
+				(Character and IsDescendantOrSelf(Candidate, Character))
+				or (Backpack and IsDescendantOrSelf(Candidate, Backpack))
+				or IsDescendantOrSelf(Candidate, workspace)
+			then
+				table.insert(Preferred, Candidate)
+			end
+		end
+
+		if #Preferred == 1 then
+			LiveInstanceResolutionCache[Target] = Preferred[1]
+			return Preferred[1]
+		end
+	end
+
+	FailedResolutionTimes[Target] = Now
+	return Target
+end
+
+wax.shared.ResolveSimpleSpyLiveInstance = ResolveLiveInstance
 
 local function IsLocalPlayerObject(Object: Instance): boolean
 	if Object.ClassName ~= "Player" then
@@ -10365,7 +10504,7 @@ local function IsLocalPlayerObject(Object: Instance): boolean
 end
 
 local function IsLocalCharacterObject(Object: Instance): boolean
-	local Parent = Object.Parent
+	local Parent = ReadParent(Object)
 	if not Parent or Object.ClassName ~= "Model" or not IsLocalPlayerObject(Parent) then
 		return false
 	end
@@ -10429,7 +10568,7 @@ end
 
 local function GetSimpleSpyInstanceReference(Current: Instance): string
 	local Name = Current.Name
-	local Parent = Current.Parent
+	local Parent = ReadParent(Current)
 	if not Parent then
 		return FormatSimpleSpyName(Name)
 	end
@@ -10476,7 +10615,7 @@ local function FindSimpleSpyCharacterAncestor(Target: Instance): Instance?
 			end
 		end
 
-		Current = Current.Parent
+		Current = ReadParent(Current)
 	end
 
 	return nil
@@ -10494,6 +10633,8 @@ local function SimpleSpyGetFullPath(Target: Instance): (string?, string?)
 		return nil, nil
 	end
 
+	Target = ResolveLiveInstance(Target)
+
 	local Character = FindSimpleSpyCharacterAncestor(Target)
 	if Character then
 		local CharacterParts = {}
@@ -10505,7 +10646,7 @@ local function SimpleSpyGetFullPath(Target: Instance): (string?, string?)
 			end
 
 			table.insert(CharacterParts, 1, FormatSimpleSpyName(Current.Name))
-			Current = Current.Parent
+			Current = ReadParent(Current)
 		end
 
 		return 'game:GetService("Players").LocalPlayer.Character' .. table.concat(CharacterParts), nil
@@ -10521,7 +10662,7 @@ local function SimpleSpyGetFullPath(Target: Instance): (string?, string?)
 			break
 		end
 
-		local Parent = Current.Parent
+		local Parent = ReadParent(Current)
 		local CurrentReference = GetSimpleSpyInstanceReference(Current)
 		if CurrentReference then
 			table.insert(PathParts, 1, CurrentReference)
@@ -10612,10 +10753,8 @@ local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
 	local Cache = wax.shared.CallPathSnapshots
 	local CacheKey = CallInfo.Arguments or CallInfo
 
-	-- Always create a fresh snapshot. The same call can be observed once inside
-	-- the hook and again after the caller resumes; reusing the first table would
-	-- preserve an obsolete Character/Workspace path instead of the nil-parent
-	-- state displayed by Cobalt.
+	-- Always create a fresh snapshot after parent resolution. This keeps the
+	-- argument UI and copied calling code on the same current Instance path.
 	local Snapshots = {
 		Event = BuildInstanceSnapshot(RemoteInstance, "Event"),
 		Instances = {},
@@ -10630,6 +10769,26 @@ local function CaptureCallPaths(CallInfo, RemoteInstance: Instance)
 	local VisitedTables = {}
 	CaptureInstancePaths(CallInfo.Arguments, Snapshots.Instances, VisitedTables)
 	CaptureInstancePaths(CallInfo.InvokeResult, Snapshots.Instances, VisitedTables)
+end
+
+local function HasUnresolvedInstancePath(Value, VisitedTables): boolean
+	if typeof(Value) == "Instance" then
+		local Path, Prelude = SimpleSpyGetFullPath(Value)
+		return type(Path) ~= "string" or Prelude ~= nil
+	end
+
+	if type(Value) ~= "table" or VisitedTables[Value] then
+		return false
+	end
+
+	VisitedTables[Value] = true
+	for Key, ChildValue in next, Value do
+		if HasUnresolvedInstancePath(Key, VisitedTables) or HasUnresolvedInstancePath(ChildValue, VisitedTables) then
+			return true
+		end
+	end
+
+	return false
 end
 
 local PendingCallDecisions = setmetatable({}, { __mode = "k" })
@@ -11232,11 +11391,9 @@ function Log:Call(RawInfo): number?
 		table.insert(self.GameCalls, Index)
 	end
 
-	-- SimpleSpy does not generate code from inside the active hook. It queues the
-	-- call and processes one item from RunService.Heartbeat. Waiting for the next
-	-- Heartbeat is significant for Tool drops: the caller can set Tool.Parent =
-	-- nil immediately after FireServer returns, and the stored replay code must
-	-- capture that nil-parent state before Cobalt exposes the log to the UI.
+	-- Generate paths outside the active hook. A dropped Tool may temporarily have
+	-- Parent == nil before Roblox reparents or replaces it with the replicated
+	-- Workspace instance. Give that transition a few Heartbeats, then publish.
 	local SnapshotInfo = Info
 	local SnapshotRemote = self.Instance
 	local SnapshotLog = self
@@ -11254,9 +11411,22 @@ function Log:Call(RawInfo): number?
 	local RunService = wax.shared.RunService
 	if RunService and RunService.Heartbeat then
 		task.spawn(function()
-			pcall(function()
-				RunService.Heartbeat:Wait()
-			end)
+			for _ = 1, 12 do
+				pcall(function()
+					RunService.Heartbeat:Wait()
+				end)
+
+				local Unresolved = false
+				pcall(function()
+					Unresolved = HasUnresolvedInstancePath(SnapshotInfo.Arguments, {})
+						or HasUnresolvedInstancePath(SnapshotInfo.InvokeResult, {})
+				end)
+
+				if not Unresolved then
+					break
+				end
+			end
+
 			CaptureAndPublish()
 		end)
 	else
@@ -22755,6 +22925,14 @@ function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 	elseif typeof(Argument) == "table" then
 		return "{...}"
 	elseif typeof(Argument) == "Instance" then
+		local LiveResolver = wax.shared.ResolveSimpleSpyLiveInstance
+		if type(LiveResolver) == "function" then
+			local Success, LiveArgument = pcall(LiveResolver, Argument)
+			if Success and typeof(LiveArgument) == "Instance" then
+				Argument = LiveArgument
+			end
+		end
+
 		-- Match Copy Calling Code: use the current SimpleSpy getFullPath result
 		-- before consulting the historical snapshot.
 		local Resolver = wax.shared.SimpleSpyGetFullPath
