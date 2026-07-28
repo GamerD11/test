@@ -23355,33 +23355,109 @@ local function ResolveSnapshotPath(Argument: Instance, PathSnapshots)
 	return nil
 end
 
-function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
-	if typeof(Argument) == "string" then
-		return string.format('"%s"', (Argument :: string))
-	elseif typeof(Argument) == "number" then
+local DefaultTablePreviewDepth = 4
+local DefaultTablePreviewEntries = 40
+local TablePreviewIndent = "    "
+
+local function GetTablePreviewLimits()
+	local Config = getgenv().CobaltSimpleSpyConfig
+	local MaxDepth = DefaultTablePreviewDepth
+	local MaxEntries = DefaultTablePreviewEntries
+
+	if type(Config) == "table" then
+		if type(Config.GUITableMaxDepth) == "number" then
+			MaxDepth = math.max(1, math.floor(Config.GUITableMaxDepth))
+		end
+		if type(Config.GUITableMaxEntries) == "number" then
+			MaxEntries = math.max(1, math.floor(Config.GUITableMaxEntries))
+		end
+	end
+
+	return MaxDepth, MaxEntries
+end
+
+local function SafeToString(Value)
+	local Success, Result = pcall(tostring, Value)
+	return Success and Result or "<unprintable>"
+end
+
+local QuickSerializeValue
+
+local function FormatTableKey(Key, PathSnapshots, State, Depth)
+	if typeof(Key) == "string" and Key:match("^[%a_][%w_]*$") then
+		return Key
+	end
+
+	return "[" .. SafeToString(QuickSerializeValue(Key, PathSnapshots, State, Depth)) .. "]"
+end
+
+local function QuickSerializeTable(Value, PathSnapshots, State, Depth)
+	if State.Active[Value] then
+		return "{ --[[CYCLE]] }"
+	end
+
+	if Depth >= State.MaxDepth then
+		return "{ --[[MAX DEPTH]] }"
+	end
+
+	State.Active[Value] = true
+
+	local Lines = { "{" }
+	local EntryCount = 0
+	local ChildIndent = string.rep(TablePreviewIndent, Depth + 1)
+	local ClosingIndent = string.rep(TablePreviewIndent, Depth)
+
+	for Key, ChildValue in next, Value do
+		EntryCount += 1
+		if EntryCount > State.MaxEntries then
+			table.insert(Lines, ChildIndent .. "--[[TABLE PREVIEW TRUNCATED]]")
+			break
+		end
+
+		local KeyText = FormatTableKey(Key, PathSnapshots, State, Depth + 1)
+		local ValueText = SafeToString(QuickSerializeValue(ChildValue, PathSnapshots, State, Depth + 1))
+		table.insert(Lines, ChildIndent .. KeyText .. " = " .. ValueText .. ",")
+	end
+
+	State.Active[Value] = nil
+
+	if EntryCount == 0 then
+		return "{}"
+	end
+
+	table.insert(Lines, ClosingIndent .. "}")
+	return table.concat(Lines, "\n")
+end
+
+QuickSerializeValue = function(Argument, PathSnapshots, State, Depth)
+	local ValueType = typeof(Argument)
+
+	if ValueType == "string" then
+		return string.format("%q", Argument)
+	elseif ValueType == "number" then
 		return LazySerializer.QuickSerializeNumber(Argument)
-	elseif typeof(Argument) == "Vector2" then
+	elseif ValueType == "Vector2" then
 		return string.format(
 			"%s, %s",
 			LazySerializer.QuickSerializeNumber(Argument.X),
 			LazySerializer.QuickSerializeNumber(Argument.Y)
 		)
-	elseif typeof(Argument) == "Vector3" then
+	elseif ValueType == "Vector3" then
 		return string.format(
 			"%s, %s, %s",
 			LazySerializer.QuickSerializeNumber(Argument.X),
 			LazySerializer.QuickSerializeNumber(Argument.Y),
 			LazySerializer.QuickSerializeNumber(Argument.Z)
 		)
-	elseif typeof(Argument) == "CFrame" then
+	elseif ValueType == "CFrame" then
 		local Components = { Argument:GetComponents() }
-		for Index, Value in pairs(Components) do
-			Components[Index] = LazySerializer.QuickSerializeNumber(Value)
+		for Index, Component in pairs(Components) do
+			Components[Index] = LazySerializer.QuickSerializeNumber(Component)
 		end
 		return table.concat(Components, ", ")
-	elseif typeof(Argument) == "table" then
-		return "{...}"
-	elseif typeof(Argument) == "Instance" then
+	elseif ValueType == "table" then
+		return QuickSerializeTable(Argument, PathSnapshots, State, Depth)
+	elseif ValueType == "Instance" then
 		local SharedResolver = wax.shared.ResolveSimpleSpyPath
 		if type(SharedResolver) == "function" then
 			local Success, Path = pcall(SharedResolver, Argument, PathSnapshots)
@@ -23396,11 +23472,20 @@ function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
 		end
 
 		return InstanceSerializer.Serialize(Argument, { DisableNilParentHandler = true })
-	elseif typeof(Argument) == "userdata" then
+	elseif ValueType == "userdata" then
 		return "newproxy(" .. (getmetatable(Argument) and "true" or "false") .. ")"
 	end
 
-	return tostring(Argument)
+	return SafeToString(Argument)
+end
+
+function LazySerializer.QuickSerializeArgument(Argument, PathSnapshots)
+	local MaxDepth, MaxEntries = GetTablePreviewLimits()
+	return QuickSerializeValue(Argument, PathSnapshots, {
+		Active = setmetatable({}, { __mode = "k" }),
+		MaxDepth = MaxDepth,
+		MaxEntries = MaxEntries,
+	}, 0)
 end
 
 return LazySerializer
