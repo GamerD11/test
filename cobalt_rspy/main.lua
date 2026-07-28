@@ -14776,6 +14776,7 @@ do
 		CornerHandleSize = 20,
 		HandleSize = 6,
 		GetDPIScale = GetDPIScale,
+		ShowCornerIcon = true,
 	})
 end
 
@@ -19819,6 +19820,8 @@ type HolderOptions = {
 	IsBlockedCall: boolean?,
 	IsError: boolean?,
 	IsPreview: boolean?,
+	HideTypeLabel: boolean?,
+	Monospace: boolean?,
 	Label: string?,
 	MaxPreviewLength: number?,
 	PreviewCache: { [number]: string }?,
@@ -19893,23 +19896,28 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 		TextTransparency = 0.5,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
+		Font = if Options.Monospace then Enum.Font.Code else Enum.Font.SourceSans,
 
 		Parent = Holder,
 	})
 	local IndexX = TextBounds.GetCachedWidth(IndexLabel.Text, IndexLabel.FontFace, IndexLabel.TextSize)
 
-	local TypeLabel = Interface.New("TextLabel", {
-		Size = UDim2.fromScale(1, 1),
-		Text = typeof(Value),
-		TextColor3 = if IsBlockedCall or IsError then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
-		TextSize = 15,
-		TextTransparency = 0.5,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextYAlignment = Enum.TextYAlignment.Top,
+	local TypeX = 0
+	if not Options.HideTypeLabel then
+		local TypeLabel = Interface.New("TextLabel", {
+			Size = UDim2.fromScale(1, 1),
+			Text = typeof(Value),
+			TextColor3 = if IsBlockedCall or IsError then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
+			TextSize = 15,
+			TextTransparency = 0.5,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			Font = if Options.Monospace then Enum.Font.Code else Enum.Font.SourceSans,
 
-		Parent = Holder,
-	})
-	local TypeX = TextBounds.GetCachedWidth(TypeLabel.Text, TypeLabel.FontFace, TypeLabel.TextSize)
+			Parent = Holder,
+		})
+		TypeX = TextBounds.GetCachedWidth(TypeLabel.Text, TypeLabel.FontFace, TypeLabel.TextSize)
+	end
 
 	local Text
 	if IsPreview then
@@ -19938,6 +19946,8 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 		TextTruncate = if IsPreview then Enum.TextTruncate.AtEnd else Enum.TextTruncate.None,
 		TextWrapped = not IsPreview,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Font = if Options.Monospace then Enum.Font.Code else Enum.Font.SourceSans,
 
 		Parent = Holder,
 	})
@@ -19989,8 +19999,20 @@ function ArgumentList.CreateHolder(Index: number, Value: any, Parent: GuiObject,
 	end
 
 	if not IsPreview then
-		local _, TextY = TextBounds.Get(TextLabel.Text, TextLabel.FontFace, TextLabel.TextSize, TextLabel.AbsoluteSize.X)
-		Holder.Size = UDim2.new(1, 0, 0, TextY + 12)
+		-- Call cards are assembled before being parented to the scrolling list, so
+		-- AbsoluteSize can still be zero here. Measure one frame later after layout
+		-- has resolved; otherwise multiline tables can receive a bogus width and
+		-- become excessively tall or remain clipped.
+		task.defer(function()
+			wax.shared.RunService.Heartbeat:Wait()
+			if not Holder.Parent or not TextLabel.Parent then
+				return
+			end
+
+			local AvailableWidth = math.max(80, TextLabel.AbsoluteSize.X)
+			local _, TextY = TextBounds.Get(TextLabel.Text, TextLabel.FontFace, TextLabel.TextSize, AvailableWidth)
+			Holder.Size = UDim2.new(1, 0, 0, TextY + 12)
+		end)
 	end
 
 	return Holder
@@ -22684,6 +22706,7 @@ function Resize.new(Options: {
 	Mirrored: boolean?,
 	LockedPosition: boolean? | UDim2?,
 	GetDPIScale: (() -> number)?,
+	ShowCornerIcon: boolean?,
 })
 	local MainFrame = Options.MainFrame
 	local HandleSize = Options.HandleSize or HANDLE_SIZE
@@ -22975,6 +22998,27 @@ function Resize.new(Options: {
 	Drag.Setup(MainFrame, BottomRightCorner, createDragHandler("Right", "Bottom"), {
 		GetDPIScale = GetDPIScale,
 	})
+
+	if Options.ShowCornerIcon then
+		local ResizeIcon = Interface.New("TextLabel", {
+			Active = true,
+			AnchorPoint = Vector2.one,
+			BackgroundTransparency = 1,
+			Position = UDim2.new(1, -2, 1, -2),
+			Size = UDim2.fromOffset(CornerHandleSize, CornerHandleSize),
+			Text = "◢",
+			TextColor3 = Color3.fromRGB(150, 150, 150),
+			TextSize = math.max(12, CornerHandleSize - 4),
+			TextTransparency = 0.15,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextYAlignment = Enum.TextYAlignment.Bottom,
+			ZIndex = 9e6 + 2,
+			Parent = MainFrame,
+		})
+		Drag.Setup(MainFrame, ResizeIcon, createDragHandler("Right", "Bottom"), {
+			GetDPIScale = GetDPIScale,
+		})
+	end
 
 	return self
 end
@@ -23355,8 +23399,10 @@ local function ResolveSnapshotPath(Argument: Instance, PathSnapshots)
 	return nil
 end
 
-local DefaultTablePreviewDepth = 4
-local DefaultTablePreviewEntries = 40
+-- Full table rendering for call cards. Cycles are still detected and a
+-- generous depth guard prevents pathological recursive payloads from freezing UI.
+local DefaultTablePreviewDepth = 64
+local DefaultTablePreviewEntries = math.huge
 local TablePreviewIndent = "    "
 
 local function GetTablePreviewLimits()
@@ -24570,9 +24616,10 @@ return function(props: {
 			if HasError then
 				ArgumentList.CreateHolder(0, CallInfo.Error, ArgumentsFrame, {
 					IsError = true,
-					IsPreview = true,
-					Label = "Error",
-					MaxPreviewLength = MaxArgumentPreviewLength,
+					IsPreview = false,
+					HideTypeLabel = true,
+					Monospace = true,
+					Label = "Error =",
 				})
 			end
 
@@ -24590,80 +24637,16 @@ return function(props: {
 
 				ArgumentList.CreateHolder(Index, CallInfoValues[Index], ArgumentsFrame, {
 					IsBlockedCall = IsBlockedCall,
-					IsPreview = true,
-					MaxPreviewLength = MaxArgumentPreviewLength,
-					PreviewCache = CallInfo.PreviewCache,
+					IsPreview = false,
+					HideTypeLabel = true,
+					Monospace = true,
+					Label = "[" .. tostring(Index) .. "] =",
 					PathSnapshots = PathSnapshots,
 				})
 			end
 		end
 
-		local OriginText = CallInfo.IsExecutor and wax.shared.ExecutorName
-			or CallInfo.IsRakNet and "RakNet"
-			or CallInfo.Origin and CallInfo.Origin.Name
-			or "Unknown"
-		local OriginIcon
-		if IsBlockedCall then
-			OriginIcon = Interface.NewIcon("ban", {
-				AnchorPoint = Vector2.yAxis,
-				ImageColor3 = Color3.fromRGB(255, 151, 151),
-				ImageTransparency = 0.5,
-				Position = UDim2.new(0, 2, 1, 0),
-				Size = UDim2.fromOffset(22, 22),
-				SizeConstraint = Enum.SizeConstraint.RelativeYY,
-			})
-		elseif CallInfo.IsRakNet then
-			OriginIcon = Interface.NewIcon("network", {
-				AnchorPoint = Vector2.yAxis,
-				ImageColor3 = Color3.new(1, 1, 1),
-				ImageTransparency = 0.5,
-				Position = UDim2.new(0, 2, 1, 0),
-				Size = UDim2.fromOffset(22, 22),
-				SizeConstraint = Enum.SizeConstraint.RelativeYY,
-			})
-		else
-			OriginIcon = Interface.NewIcon(CallInfo.IsExecutor and "terminal" or "gamepad-2", {
-				AnchorPoint = Vector2.yAxis,
-				ImageColor3 = Color3.new(1, 1, 1),
-				ImageTransparency = 0.5,
-				Position = UDim2.new(0, 2, 1, 0),
-				Size = UDim2.fromOffset(22, 22),
-				SizeConstraint = Enum.SizeConstraint.RelativeYY,
-			})
-		end
-
-		Interface.New("Frame", {
-			BackgroundTransparency = 1,
-			Size = UDim2.new(1, 0, 0, 22),
-
-			OriginIcon,
-
-			Interface.New("TextLabel", {
-				AnchorPoint = Vector2.yAxis,
-				Position = UDim2.new(0, 30, 1, 0),
-				Size = UDim2.new(0.5, -24, 0, 22),
-				BackgroundTransparency = 1,
-				Text = if IsBlockedCall then `{OriginText} (Blocked)` else OriginText,
-				TextColor3 = if IsBlockedCall then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
-				TextSize = 16,
-				TextXAlignment = Enum.TextXAlignment.Left,
-				TextTransparency = 0.5,
-			}),
-
-			Interface.New("TextLabel", {
-				AnchorPoint = Vector2.one,
-				Position = UDim2.new(1, -2, 1, 0),
-				Size = UDim2.new(0.5, -2, 0, 22),
-				BackgroundTransparency = 1,
-				Text = "Time: " .. os.date("%X", CallInfo.CreationTime),
-				TextColor3 = if IsBlockedCall then Color3.fromRGB(255, 190, 190) else Color3.new(1, 1, 1),
-				TextSize = 16,
-				TextTransparency = 0.5,
-				TextXAlignment = Enum.TextXAlignment.Right,
-			}),
-
-			Parent = CallFrame,
-		})
+		-- Caller/origin footer removed to give argument data the full card width and height.
 
 		if ReleaseIfStale() then
 			return
