@@ -8606,12 +8606,77 @@ addcmd("enableshiftlock", {"enablesl", "shiftlock"}, function(args, speaker)
 	notify("Shiftlock", "Shift lock should now be available")
 end)
 
-addcmd('firstp',{},function(args, speaker)
-	speaker.CameraMode = "LockFirstPerson"
+local forceThirdPerson = false
+local thirdPersonPropertyConnection = nil
+local THIRD_PERSON_RENDER_NAME = "IY_ForceThirdPerson"
+
+local function stopForceThirdPerson()
+	forceThirdPerson = false
+
+	pcall(function()
+		RunService:UnbindFromRenderStep(THIRD_PERSON_RENDER_NAME)
+	end)
+
+	if thirdPersonPropertyConnection then
+		thirdPersonPropertyConnection:Disconnect()
+		thirdPersonPropertyConnection = nil
+	end
+end
+
+local function enforceThirdPerson(speaker)
+	if not forceThirdPerson or not speaker then
+		return
+	end
+
+	if speaker.CameraMode ~= Enum.CameraMode.Classic then
+		speaker.CameraMode = Enum.CameraMode.Classic
+	end
+
+	-- Prevent zoom settings from locking the camera into first person.
+	if speaker.CameraMinZoomDistance ~= 0.5 then
+		speaker.CameraMinZoomDistance = 0.5
+	end
+
+	if speaker.CameraMaxZoomDistance ~= 400 then
+		speaker.CameraMaxZoomDistance = 400
+	end
+end
+
+addcmd("firstp", {}, function(args, speaker)
+	stopForceThirdPerson()
+
+	speaker.CameraMode = Enum.CameraMode.LockFirstPerson
 end)
 
-addcmd('thirdp',{},function(args, speaker)
-	speaker.CameraMode = "Classic"
+addcmd("thirdp", {}, function(args, speaker)
+	stopForceThirdPerson()
+
+	forceThirdPerson = true
+
+	-- Immediately correct direct CameraMode changes.
+	thirdPersonPropertyConnection =
+		speaker:GetPropertyChangedSignal("CameraMode"):Connect(function()
+			if forceThirdPerson
+				and speaker.CameraMode ~= Enum.CameraMode.Classic then
+
+				task.defer(enforceThirdPerson, speaker)
+			end
+		end)
+
+	-- Run after most camera LocalScripts every rendered frame.
+	RunService:BindToRenderStep(
+		THIRD_PERSON_RENDER_NAME,
+		Enum.RenderPriority.Last.Value + 1,
+		function()
+			enforceThirdPerson(speaker)
+		end
+	)
+
+	enforceThirdPerson(speaker)
+end)
+
+addcmd("unthirdp", {"noforcethirdp"}, function(args, speaker)
+	stopForceThirdPerson()
 end)
 
 addcmd('noclipcam', {'nccam'}, function(args, speaker)
