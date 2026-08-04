@@ -11791,6 +11791,8 @@ addcmd("toggleflyfling", {}, function(args, speaker)
 end)
 
 walkflinging = false
+local VELOCITY = Vector3.new(-2^53, -2^53, 0)
+
 addcmd("walkfling", {}, function(args, speaker)
 	execCmd("unwalkfling")
 	local humanoid = speaker.Character:FindFirstChildWhichIsA("Humanoid")
@@ -11813,17 +11815,24 @@ addcmd("walkfling", {}, function(args, speaker)
 			root = getRoot(character)
 		end
 
-		vel = root.Velocity
-		root.Velocity = vel * 10000 + Vector3.new(0, 10000, 0)
+		vel = root.AssemblyLinearVelocity
+
+		root.AssemblyLinearVelocity = Vector3.new(
+			vel.X * VELOCITY.X,
+			vel.Y * VELOCITY.Y,
+			vel.Z * VELOCITY.Z
+		)
 
 		RunService.RenderStepped:Wait()
+
 		if character and character.Parent and root and root.Parent then
-			root.Velocity = vel
+			root.AssemblyLinearVelocity = vel
 		end
 
 		RunService.Stepped:Wait()
+
 		if character and character.Parent and root and root.Parent then
-			root.Velocity = vel + Vector3.new(0, movel, 0)
+			root.AssemblyLinearVelocity = vel + Vector3.new(0, movel, 0)
 			movel = movel * -1
 		end
 	until walkflinging == false
