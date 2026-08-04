@@ -11792,7 +11792,6 @@ end)
 
 walkflinging = false
 local VELOCITY = Vector3.new(-2^53, -2^53, 0)
-
 addcmd("walkfling", {}, function(args, speaker)
 	execCmd("unwalkfling")
 	local humanoid = speaker.Character:FindFirstChildWhichIsA("Humanoid")
@@ -11807,7 +11806,7 @@ addcmd("walkfling", {}, function(args, speaker)
 	repeat RunService.Heartbeat:Wait()
 		local character = speaker.Character
 		local root = getRoot(character)
-		local vel, movel = nil, 0.1
+		local movel = 0.1
 
 		while not (character and character.Parent and root and root.Parent) do
 			RunService.Heartbeat:Wait()
@@ -11815,26 +11814,43 @@ addcmd("walkfling", {}, function(args, speaker)
 			root = getRoot(character)
 		end
 
-		vel = root.AssemblyLinearVelocity
+		local parts = {}
+		for _, v in ipairs(character:GetDescendants()) do
+			if v:IsA("BasePart") then
+				table.insert(parts, v)
+			end
+		end
 
-		root.AssemblyLinearVelocity = Vector3.new(
-			vel.X * VELOCITY.X,
-			vel.Y * VELOCITY.Y,
-			vel.Z * VELOCITY.Z
-		)
+		local vels = {}
+		for _, part in ipairs(parts) do
+			vels[part] = part.AssemblyLinearVelocity
+		end
+
+		for _, part in ipairs(parts) do
+			part.AssemblyLinearVelocity = Vector3.new(
+				vels[part].X * VELOCITY.X,
+				vels[part].Y * VELOCITY.Y,
+				vels[part].Z * VELOCITY.Z
+			)
+		end
 
 		RunService.RenderStepped:Wait()
 
-		if character and character.Parent and root and root.Parent then
-			root.AssemblyLinearVelocity = vel
+		for _, part in ipairs(parts) do
+			if part and part.Parent then
+				part.AssemblyLinearVelocity = vels[part]
+			end
 		end
 
 		RunService.Stepped:Wait()
 
-		if character and character.Parent and root and root.Parent then
-			root.AssemblyLinearVelocity = vel + Vector3.new(0, movel, 0)
-			movel = movel * -1
+		for _, part in ipairs(parts) do
+			if part and part.Parent then
+				part.AssemblyLinearVelocity = vels[part] + Vector3.new(0, movel, 0)
+			end
 		end
+
+		movel = movel * -1
 	until walkflinging == false
 end)
 
