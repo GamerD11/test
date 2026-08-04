@@ -11791,7 +11791,8 @@ addcmd("toggleflyfling", {}, function(args, speaker)
 end)
 
 walkflinging = false
-local VELOCITY = Vector3.new(-2^53, -2^53, 0)
+local VELOCITY = Vector3.new(-2^53, -2^53, -2^53)
+
 addcmd("walkfling", {}, function(args, speaker)
 	execCmd("unwalkfling")
 	local humanoid = speaker.Character:FindFirstChildWhichIsA("Humanoid")
@@ -11806,7 +11807,7 @@ addcmd("walkfling", {}, function(args, speaker)
 	repeat RunService.Heartbeat:Wait()
 		local character = speaker.Character
 		local root = getRoot(character)
-		local movel = 0.1
+		local vel, movel = nil, 0.1
 
 		while not (character and character.Parent and root and root.Parent) do
 			RunService.Heartbeat:Wait()
@@ -11814,43 +11815,26 @@ addcmd("walkfling", {}, function(args, speaker)
 			root = getRoot(character)
 		end
 
-		local parts = {}
-		for _, v in ipairs(character:GetDescendants()) do
-			if v:IsA("BasePart") then
-				table.insert(parts, v)
-			end
-		end
+		vel = root.AssemblyLinearVelocity
 
-		local vels = {}
-		for _, part in ipairs(parts) do
-			vels[part] = part.AssemblyLinearVelocity
-		end
-
-		for _, part in ipairs(parts) do
-			part.AssemblyLinearVelocity = Vector3.new(
-				vels[part].X * VELOCITY.X,
-				vels[part].Y * VELOCITY.Y,
-				vels[part].Z * VELOCITY.Z
-			)
-		end
+		root.AssemblyLinearVelocity = Vector3.new(
+			vel.X * VELOCITY.X,
+			vel.Y * VELOCITY.Y,
+			vel.Z * VELOCITY.Z
+		)
 
 		RunService.RenderStepped:Wait()
 
-		for _, part in ipairs(parts) do
-			if part and part.Parent then
-				part.AssemblyLinearVelocity = vels[part]
-			end
+		if character and character.Parent and root and root.Parent then
+			root.AssemblyLinearVelocity = vel
 		end
 
 		RunService.Stepped:Wait()
 
-		for _, part in ipairs(parts) do
-			if part and part.Parent then
-				part.AssemblyLinearVelocity = vels[part] + Vector3.new(0, movel, 0)
-			end
+		if character and character.Parent and root and root.Parent then
+			root.AssemblyLinearVelocity = vel + Vector3.new(0, movel, 0)
+			movel = movel * -1
 		end
-
-		movel = movel * -1
 	until walkflinging == false
 end)
 
